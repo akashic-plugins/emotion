@@ -1,0 +1,15 @@
+{
+  "name": "emotion",
+  "version": "0.1.0",
+  "description": "Akashic emotion and proactive tuning plugin",
+  "paths": {
+    "drift_skills": [
+      "drift/skills"
+    ]
+  },
+  "akashic": {
+    "lifecycle": {
+      "entry": "plugin.py"
+    }
+  }
+}

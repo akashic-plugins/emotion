@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, cast
 
-SKILL_NAME = "emotion:feedback-preference-context"
+SKILL_NAME = "feedback-preference-context"
 PROACTIVE_TEXT_LIMIT = 100
 QUESTION_MARKERS = ("吗", "么", "为什么", "怎么", "谁", "哪")
 

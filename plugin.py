@@ -13,7 +13,7 @@ from .db import apply_feedback, build_effect, get_state, open_db
 
 logger = logging.getLogger("plugin.emotion")
 
-_FEEDBACK_CONTEXT_SKILL = "emotion:feedback-preference-context"
+_FEEDBACK_CONTEXT_SKILL = "feedback-preference-context"
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
 
 在这里写会影响未来主动推送取舍的稳定偏好。

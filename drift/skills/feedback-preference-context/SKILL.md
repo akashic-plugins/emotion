@@ -1,5 +1,5 @@
 ---
-name: emotion:feedback-preference-context
+name: feedback-preference-context
 description: 从 proactive 正反馈中归纳待审核推送偏好候选，追加到 proactive_pending.md 队列。
 ---
 
@@ -28,7 +28,7 @@ feedback events
 ## 固定脚本
 
 ```bash
-python3 skills/emotion:feedback-preference-context/scripts/sample_feedback_context.py sample --drift-dir . --chunk-index 0 --chunk-size 10
+python3 skills/feedback-preference-context/scripts/sample_feedback_context.py sample --drift-dir . --chunk-index 0 --chunk-size 10
 ```
 
 脚本只负责取数：
@@ -55,7 +55,7 @@ sample
 
 ```json
 {
-  "command": "python3 skills/emotion:feedback-preference-context/scripts/sample_feedback_context.py sample --drift-dir . --chunk-index 0 --chunk-size 10",
+  "command": "python3 skills/feedback-preference-context/scripts/sample_feedback_context.py sample --drift-dir . --chunk-index 0 --chunk-size 10",
   "cwd": ".",
   "description": "读取 proactive feedback 第 0 个 chunk",
   "timeout": 30
@@ -158,7 +158,7 @@ sample
 
 ```json
 {
-  "skill_used": "emotion:feedback-preference-context",
+  "skill_used": "feedback-preference-context",
   "status": "completed",
   "briefing": "根据 proactive 正反馈样本追加 proactive_pending.md 队列",
   "message_result": "silent",

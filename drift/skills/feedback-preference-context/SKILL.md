@@ -62,7 +62,7 @@ sample
 }
 ```
 
-3. 如果 `found=false`，用 `finish_drift(status="waiting", message_result="silent")` 静默结束，不推进 cursor。
+3. 如果 `found=false`，用 `finish_drift(status="completed", message_result="silent")` 静默结束，不推进 cursor；无新数据表示本轮检查已闭环，不是暂停。
 4. 有样本时先读取 `../proactive_pending.md`，确认现有文件内容和末尾位置；文件不存在就用空内容处理。
    - 必须使用路径 `../proactive_pending.md`。
    - 禁止使用 `proactive_pending.md` 或 `./proactive_pending.md`，那会写到 drift 目录而不是 workspace 根目录。

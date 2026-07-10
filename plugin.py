@@ -88,6 +88,10 @@ class EmotionProactivePromptModule:
 
 
 class EmotionPlugin(Plugin):
+    @classmethod
+    def dashboard_module(cls) -> str | None:
+        return "dashboard.py"
+
     name = "emotion"
     version = "1.0.0"
 

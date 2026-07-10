@@ -68,7 +68,10 @@ _MERGE_PROACTIVE_CONTEXT_PROMPT = """\
 
 class EmotionProactivePromptModule:
     slot = "proactive.prompt.emotion"
-    phase = "proactive.prompt"
+    produces = (
+        "proactive:prompt:system_bottom:emotion",
+        "proactive:effect:emotion",
+    )
 
     def __init__(self, plugin: "EmotionPlugin") -> None:
         self._plugin = plugin

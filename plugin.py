@@ -89,6 +89,11 @@ class EmotionProactivePromptModule:
 
 class EmotionPlugin(Plugin):
     name = "emotion"
+    version = "1.0.0"
+
+    @classmethod
+    def drift_skill_roots(cls) -> tuple[str, ...]:
+        return ("drift/skills",)
 
     async def initialize(self) -> None:
         workspace = self.context.workspace

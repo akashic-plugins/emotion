@@ -9,10 +9,13 @@ from typing import Any, Iterator
 
 from fastapi import FastAPI
 
+from .db import EmotionState, describe_behavior
+
 
 class EmotionDashboardReader:
     def __init__(self, workspace: Path) -> None:
         self.db_path = workspace / "emotion" / "emotion.db"
+        self.sessions_db_path = workspace / "sessions.db"
         self._lock = threading.RLock()
 
     def get_overview(self) -> dict[str, Any]:
@@ -24,21 +27,85 @@ class EmotionDashboardReader:
                     "SELECT valence, arousal, dominance, updated_at FROM emotion_state WHERE id = 1"
                 ).fetchone()
                 event_count = _scalar_int(db, "SELECT count(*) FROM emotion_events")
+                influence_count = _scalar_int(
+                    db,
+                    """
+                    SELECT count(*) FROM emotion_events
+                    WHERE abs(valence_delta) > 0.000001
+                       OR abs(dominance_delta) > 0.000001
+                    """,
+                )
                 effect_count = _scalar_int(db, "SELECT count(*) FROM emotion_effects")
                 last_effect = db.execute(
                     """
-                    SELECT created_at
+                    SELECT created_at, tone_label, expected_effect, threshold_delta
                     FROM emotion_effects
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     """
                 ).fetchone()
+        current_state = dict(state) if state is not None else None
+        current_behavior = None
+        if state is not None:
+            behavior = describe_behavior(
+                EmotionState(
+                    valence=float(state["valence"]),
+                    arousal=float(state["arousal"]),
+                    dominance=float(state["dominance"]),
+                    updated_at=str(state["updated_at"]),
+                )
+            )
+            current_behavior = {
+                "tone_label": behavior.tone_label,
+                "expected_effect": behavior.expected_effect,
+                "threshold_delta": behavior.threshold_delta,
+            }
         return {
-            "state": dict(state) if state is not None else None,
+            "state": current_state,
+            "current_behavior": current_behavior,
             "event_count": event_count,
+            "influence_count": influence_count,
             "effect_count": effect_count,
             "last_effect_at": last_effect["created_at"] if last_effect else None,
+            "last_effect": dict(last_effect) if last_effect is not None else None,
         }
+
+    def list_influences(self, *, limit: int = 30) -> list[dict[str, Any]]:
+        """返回真正改变主动状态的近期反馈。"""
+
+        # 1. 只读取产生状态增量的反馈，跳过每次主动 tick 的重复 effect
+        if not self.db_path.exists():
+            return []
+        safe_limit = max(1, min(limit, 50))
+        with self._lock:
+            with _connect(self.db_path) as db:
+                rows = db.execute(
+                    """
+                    SELECT
+                        id,
+                        created_at,
+                        source_type,
+                        valence_delta,
+                        dominance_delta,
+                        valence_after,
+                        dominance_after,
+                        reason,
+                        payload_json
+                    FROM emotion_events
+                    WHERE abs(valence_delta) > 0.000001
+                       OR abs(dominance_delta) > 0.000001
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+
+        # 2. 用事件已持有的消息 ID 补齐可读预览
+        decoded = [_decode_influence(row) for row in rows]
+        previews = self._load_user_previews(decoded)
+        for item in decoded:
+            item["user_preview"] = _preview(previews.get(str(item["user_message_id"])))
+        return decoded
 
     def list_effects(
         self,
@@ -76,6 +143,18 @@ class EmotionDashboardReader:
                 ).fetchone()
         return _decode_effect(row) if row is not None else None
 
+    def _load_user_previews(self, items: list[dict[str, Any]]) -> dict[str, str]:
+        if not items or not self.sessions_db_path.exists():
+            return {}
+        ids = list(dict.fromkeys(str(item["user_message_id"]) for item in items))
+        placeholders = ",".join("?" for _ in ids)
+        with _connect(self.sessions_db_path) as db:
+            rows = db.execute(
+                f"SELECT id, content FROM messages WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {str(row["id"]): str(row["content"] or "") for row in rows}
+
 
 def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> None:
     _ = plugin_dir
@@ -106,9 +185,12 @@ def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> None:
 def _empty_overview() -> dict[str, Any]:
     return {
         "state": None,
+        "current_behavior": None,
         "event_count": 0,
+        "influence_count": 0,
         "effect_count": 0,
         "last_effect_at": None,
+        "last_effect": None,
     }
 
 
@@ -134,3 +216,17 @@ def _decode_effect(row: sqlite3.Row) -> dict[str, Any]:
     except Exception:
         payload["metadata"] = {}
     return payload
+
+
+def _decode_influence(row: sqlite3.Row) -> dict[str, Any]:
+    payload = dict(row)
+    metadata = json.loads(str(payload.pop("payload_json")))
+    payload["user_message_id"] = str(metadata["user_message_id"])
+    return payload
+
+
+def _preview(value: str | None, limit: int = 180) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."

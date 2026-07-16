@@ -26,6 +26,14 @@ class FeedbackDelta:
     reason: str
 
 
+@dataclass(frozen=True)
+class EmotionBehavior:
+    tone_label: str
+    tone_instruction: str
+    threshold_delta: float
+    expected_effect: str
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -179,10 +187,12 @@ def build_effect(
         updated_at=now_utc.isoformat(),
     )
     _save_state(conn, state)
-    tone_label, tone_instruction = _tone(state)
-    threshold_delta = _threshold_delta(state.dominance)
+    behavior = describe_behavior(state)
+    tone_label = behavior.tone_label
+    tone_instruction = behavior.tone_instruction
+    threshold_delta = behavior.threshold_delta
     final_threshold = _clamp_threshold(base_threshold + threshold_delta)
-    expected_effect = _expected_effect(threshold_delta)
+    expected_effect = behavior.expected_effect
     prompt_section = (
         f"当前 VAD: valence={state.valence:.2f}, arousal={state.arousal:.2f}, dominance={state.dominance:.2f}。\n"
         f"语气约束: {tone_instruction}\n"
@@ -303,6 +313,19 @@ def _threshold_delta(dominance: float) -> float:
     if dominance <= -0.25:
         return 0.04
     return 0.0
+
+
+def describe_behavior(state: EmotionState) -> EmotionBehavior:
+    """把当前 VAD 状态解释为下一次主动运行会采用的行为。"""
+
+    tone_label, tone_instruction = _tone(state)
+    threshold_delta = _threshold_delta(state.dominance)
+    return EmotionBehavior(
+        tone_label=tone_label,
+        tone_instruction=tone_instruction,
+        threshold_delta=threshold_delta,
+        expected_effect=_expected_effect(threshold_delta),
+    )
 
 
 def _tone(state: EmotionState) -> tuple[str, str]:

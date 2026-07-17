@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from bus.events_lifecycle import DriftFinished
 from proactive_v2.frame import ProactiveFrame
 
 from .db import apply_feedback, build_effect, get_state, open_db
+from .dashboard import EmotionDashboardReader
 
 logger = logging.getLogger("plugin.emotion")
 
@@ -92,6 +94,14 @@ class EmotionPlugin(Plugin):
     def dashboard_module(cls) -> str | None:
         return "dashboard.py"
 
+    @classmethod
+    def mobile_ui_module(cls) -> str | None:
+        return "mobile_panel.js"
+
+    @classmethod
+    def mobile_ui_stylesheet(cls) -> str | None:
+        return "mobile_panel.css"
+
     name = "emotion"
     version = "1.0.0"
 
@@ -111,6 +121,34 @@ class EmotionPlugin(Plugin):
 
     async def terminate(self) -> None:
         return None
+
+    async def mobile_ui_call(
+        self,
+        method: str,
+        payload: dict[str, object],
+        *,
+        session_id: str | None,
+        turn_id: str | None,
+    ) -> dict[str, object]:
+        """返回反馈如何调节主动状态的移动投影。"""
+
+        # 1. 在插件 RPC 边界校验方法与列表上限
+        _ = session_id, turn_id
+        if method not in {"emotion.overview", "emotion.influences"}:
+            raise ValueError(f"未知 emotion 移动方法: {method}")
+        workspace = self.context.workspace
+        if workspace is None:
+            raise RuntimeError("emotion 移动看板缺少 workspace")
+        reader = EmotionDashboardReader(workspace)
+        if method == "emotion.overview":
+            return await asyncio.to_thread(reader.get_overview)
+        limit = payload.get("limit", 30)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+            raise ValueError("limit 必须是 1 到 50 的整数")
+
+        # 2. 列表只返回真正改变状态的反馈，不返回高频主动 tick
+        items = await asyncio.to_thread(reader.list_influences, limit=limit)
+        return {"items": items}
 
     def proactive_modules(self) -> list[object]:
         return [EmotionProactivePromptModule(self)]

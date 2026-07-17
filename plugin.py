@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 
-from agent.plugins import EventTrigger, Plugin, PluginJobContext, PluginJobSpec, tool
+from agent.plugins import (
+    EventTrigger,
+    MobileUiContribution,
+    MobileUiNavigation,
+    Plugin,
+    PluginJobContext,
+    PluginJobSpec,
+    tool,
+)
+from agent.plugins.mobile_ui import MobileUiRpcInvalidRequest
 from bus.events_proactive import ProactiveFeedbackRecorded
 from bus.events_lifecycle import DriftFinished
 from proactive_v2.frame import ProactiveFrame
@@ -95,15 +103,18 @@ class EmotionPlugin(Plugin):
         return "dashboard.py"
 
     @classmethod
-    def mobile_ui_module(cls) -> str | None:
-        return "mobile_panel.js"
-
-    @classmethod
-    def mobile_ui_stylesheet(cls) -> str | None:
-        return "mobile_panel.css"
+    def mobile_ui(cls) -> MobileUiContribution:
+        return MobileUiContribution(
+            module="mobile_panel.js",
+            stylesheet="mobile_panel.css",
+            navigation=MobileUiNavigation(
+                label="主动状态",
+                description="反馈如何改变 Agent 的语气和主动发送把握",
+            ),
+        )
 
     name = "emotion"
-    version = "1.0.0"
+    version = "1.1.0"
 
     @classmethod
     def drift_skill_roots(cls) -> tuple[str, ...]:
@@ -122,7 +133,7 @@ class EmotionPlugin(Plugin):
     async def terminate(self) -> None:
         return None
 
-    async def mobile_ui_call(
+    def mobile_ui_query(
         self,
         method: str,
         payload: dict[str, object],
@@ -134,21 +145,17 @@ class EmotionPlugin(Plugin):
 
         # 1. 在插件 RPC 边界校验方法与列表上限
         _ = session_id, turn_id
-        if method not in {"emotion.overview", "emotion.influences"}:
-            raise ValueError(f"未知 emotion 移动方法: {method}")
+        if method != "emotion.bootstrap":
+            raise MobileUiRpcInvalidRequest(f"未知 emotion 移动方法: {method}")
         workspace = self.context.workspace
         if workspace is None:
             raise RuntimeError("emotion 移动看板缺少 workspace")
-        reader = EmotionDashboardReader(workspace)
-        if method == "emotion.overview":
-            return await asyncio.to_thread(reader.get_overview)
         limit = payload.get("limit", 30)
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
-            raise ValueError("limit 必须是 1 到 50 的整数")
+            raise MobileUiRpcInvalidRequest("limit 必须是 1 到 50 的整数")
 
-        # 2. 列表只返回真正改变状态的反馈，不返回高频主动 tick
-        items = await asyncio.to_thread(reader.list_influences, limit=limit)
-        return {"items": items}
+        # 2. 单个 SQLite 快照返回首屏全部区域
+        return EmotionDashboardReader(workspace).get_mobile_bootstrap(limit=limit)
 
     def proactive_modules(self) -> list[object]:
         return [EmotionProactivePromptModule(self)]

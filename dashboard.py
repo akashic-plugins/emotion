@@ -23,52 +23,7 @@ class EmotionDashboardReader:
             return _empty_overview()
         with self._lock:
             with _connect(self.db_path) as db:
-                state = db.execute(
-                    "SELECT valence, arousal, dominance, updated_at FROM emotion_state WHERE id = 1"
-                ).fetchone()
-                event_count = _scalar_int(db, "SELECT count(*) FROM emotion_events")
-                influence_count = _scalar_int(
-                    db,
-                    """
-                    SELECT count(*) FROM emotion_events
-                    WHERE abs(valence_delta) > 0.000001
-                       OR abs(dominance_delta) > 0.000001
-                    """,
-                )
-                effect_count = _scalar_int(db, "SELECT count(*) FROM emotion_effects")
-                last_effect = db.execute(
-                    """
-                    SELECT created_at, tone_label, expected_effect, threshold_delta
-                    FROM emotion_effects
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT 1
-                    """
-                ).fetchone()
-        current_state = dict(state) if state is not None else None
-        current_behavior = None
-        if state is not None:
-            behavior = describe_behavior(
-                EmotionState(
-                    valence=float(state["valence"]),
-                    arousal=float(state["arousal"]),
-                    dominance=float(state["dominance"]),
-                    updated_at=str(state["updated_at"]),
-                )
-            )
-            current_behavior = {
-                "tone_label": behavior.tone_label,
-                "expected_effect": behavior.expected_effect,
-                "threshold_delta": behavior.threshold_delta,
-            }
-        return {
-            "state": current_state,
-            "current_behavior": current_behavior,
-            "event_count": event_count,
-            "influence_count": influence_count,
-            "effect_count": effect_count,
-            "last_effect_at": last_effect["created_at"] if last_effect else None,
-            "last_effect": dict(last_effect) if last_effect is not None else None,
-        }
+                return _overview_from_db(db)
 
     def list_influences(self, *, limit: int = 30) -> list[dict[str, Any]]:
         """返回真正改变主动状态的近期反馈。"""
@@ -79,26 +34,7 @@ class EmotionDashboardReader:
         safe_limit = max(1, min(limit, 50))
         with self._lock:
             with _connect(self.db_path) as db:
-                rows = db.execute(
-                    """
-                    SELECT
-                        id,
-                        created_at,
-                        source_type,
-                        valence_delta,
-                        dominance_delta,
-                        valence_after,
-                        dominance_after,
-                        reason,
-                        payload_json
-                    FROM emotion_events
-                    WHERE abs(valence_delta) > 0.000001
-                       OR abs(dominance_delta) > 0.000001
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (safe_limit,),
-                ).fetchall()
+                rows = _influence_rows(db, safe_limit)
 
         # 2. 用事件已持有的消息 ID 补齐可读预览
         decoded = [_decode_influence(row) for row in rows]
@@ -106,6 +42,25 @@ class EmotionDashboardReader:
         for item in decoded:
             item["user_preview"] = _preview(previews.get(str(item["user_message_id"])))
         return decoded
+
+    def get_mobile_bootstrap(self, *, limit: int = 30) -> dict[str, Any]:
+        """从一个已提交快照返回移动首屏状态和影响列表。"""
+
+        # 1. 同一个显式读事务固定 emotion DB 快照
+        if not self.db_path.exists():
+            return {"overview": _empty_overview(), "items": []}
+        safe_limit = max(1, min(limit, 50))
+        with self._lock:
+            with _connect(self.db_path) as db:
+                _ = db.execute("BEGIN")
+                overview = _overview_from_db(db)
+                decoded = [_decode_influence(row) for row in _influence_rows(db, safe_limit)]
+
+        # 2. 会话预览是独立数据源，只补充文案，不参与 emotion 状态一致性
+        previews = self._load_user_previews(decoded)
+        for item in decoded:
+            item["user_preview"] = _preview(previews.get(str(item["user_message_id"])))
+        return {"overview": overview, "items": decoded}
 
     def list_effects(
         self,
@@ -207,6 +162,74 @@ def _connect(path: Path) -> Iterator[sqlite3.Connection]:
 def _scalar_int(db: sqlite3.Connection, sql: str) -> int:
     row = db.execute(sql).fetchone()
     return int(row[0] or 0) if row is not None else 0
+
+
+def _overview_from_db(db: sqlite3.Connection) -> dict[str, Any]:
+    state = db.execute(
+        "SELECT valence, arousal, dominance, updated_at FROM emotion_state WHERE id = 1"
+    ).fetchone()
+    last_effect = db.execute(
+        """
+        SELECT created_at, tone_label, expected_effect, threshold_delta
+        FROM emotion_effects
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    current_behavior = None
+    if state is not None:
+        behavior = describe_behavior(
+            EmotionState(
+                valence=float(state["valence"]),
+                arousal=float(state["arousal"]),
+                dominance=float(state["dominance"]),
+                updated_at=str(state["updated_at"]),
+            )
+        )
+        current_behavior = {
+            "tone_label": behavior.tone_label,
+            "expected_effect": behavior.expected_effect,
+            "threshold_delta": behavior.threshold_delta,
+        }
+    return {
+        "state": dict(state) if state is not None else None,
+        "current_behavior": current_behavior,
+        "event_count": _scalar_int(db, "SELECT count(*) FROM emotion_events"),
+        "influence_count": _scalar_int(
+            db,
+            """
+            SELECT count(*) FROM emotion_events
+            WHERE abs(valence_delta) > 0.000001
+               OR abs(dominance_delta) > 0.000001
+            """,
+        ),
+        "effect_count": _scalar_int(db, "SELECT count(*) FROM emotion_effects"),
+        "last_effect_at": last_effect["created_at"] if last_effect else None,
+        "last_effect": dict(last_effect) if last_effect is not None else None,
+    }
+
+
+def _influence_rows(db: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    return db.execute(
+        """
+        SELECT
+            id,
+            created_at,
+            source_type,
+            valence_delta,
+            dominance_delta,
+            valence_after,
+            dominance_after,
+            reason,
+            payload_json
+        FROM emotion_events
+        WHERE abs(valence_delta) > 0.000001
+           OR abs(dominance_delta) > 0.000001
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
 
 
 def _decode_effect(row: sqlite3.Row) -> dict[str, Any]:

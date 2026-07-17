@@ -109,11 +109,10 @@ const dashboard = {
       metricsTrigger.classList.toggle("is-expanded", expanded);
     });
 
-    Promise.all([
-      context.request("emotion.overview"),
-      context.request("emotion.influences", { limit: 30 }),
-    ]).then(([overview, history]) => {
+    context.query("emotion.bootstrap", { limit: 30 }).then((bootstrap) => {
       if (!active) return;
+      const overview = bootstrap.overview || {};
+      const history = { items: bootstrap.items || [] };
       const state = overview.state || {};
       const behavior = overview.current_behavior || {};
       const tone = String(behavior.tone_label || "neutral");
@@ -152,9 +151,5 @@ const dashboard = {
 
 export default {
   slots: {},
-  navigation: {
-    label: "主动状态",
-    description: "反馈如何改变 Agent 的语气和主动发送把握",
-  },
   dashboard,
 };

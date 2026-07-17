@@ -121,18 +121,14 @@ async def test_mobile_projection_returns_state_and_real_influences(tmp_path: Pat
                 matched_by="recent_pua",
             )
         )
-        overview = await plugin.mobile_ui_call(
-            "emotion.overview",
-            {},
-            session_id=None,
-            turn_id=None,
-        )
-        history = await plugin.mobile_ui_call(
-            "emotion.influences",
+        bootstrap = plugin.mobile_ui_query(
+            "emotion.bootstrap",
             {"limit": 10},
             session_id=None,
             turn_id=None,
         )
+        overview = bootstrap["overview"]
+        history = {"items": bootstrap["items"]}
     finally:
         await plugin.terminate()
 
@@ -151,8 +147,8 @@ async def test_mobile_projection_rejects_invalid_limit(tmp_path: Path) -> None:
     plugin.context = _plugin_context(tmp_path)
 
     with pytest.raises(ValueError, match="limit 必须"):
-        await plugin.mobile_ui_call(
-            "emotion.influences",
+        plugin.mobile_ui_query(
+            "emotion.bootstrap",
             {"limit": True},
             session_id=None,
             turn_id=None,

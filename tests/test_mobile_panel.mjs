@@ -87,8 +87,7 @@ class DashboardHost extends FakeElement {
 }
 
 test("mobile navigation describes the emotion task instead of raw VAD", () => {
-  assert.equal(panel.default.navigation.label, "主动状态");
-  assert.match(panel.default.navigation.description, /语气和主动发送/);
+  assert.equal(panel.default.navigation, undefined);
   assert.equal(typeof panel.default.dashboard.mount, "function");
 });
 
@@ -111,7 +110,7 @@ test("dashboard keeps raw metrics inert until the user asks for them", async () 
   globalThis.document = { createElement() { return new FakeElement(); } };
   const host = new DashboardHost();
   panel.default.dashboard.mount(host, {
-    request(method) {
+    query(method) {
       if (method === "emotion.overview") {
         return Promise.resolve({
           state: { valence: 0.1, arousal: 0.2, dominance: 0.3 },

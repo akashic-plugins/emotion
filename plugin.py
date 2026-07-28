@@ -98,6 +98,7 @@ class EmotionProactivePromptModule:
 
 
 class EmotionPlugin(Plugin):
+    api_version = 2
     @classmethod
     def dashboard_module(cls) -> str | None:
         return "dashboard.py"
@@ -120,7 +121,7 @@ class EmotionPlugin(Plugin):
     def drift_skill_roots(cls) -> tuple[str, ...]:
         return ("drift/skills",)
 
-    async def initialize(self) -> None:
+    def activate(self) -> None:
         workspace = self.context.workspace
         if workspace is None:
             logger.warning("emotion 插件缺少 workspace，跳过加载")

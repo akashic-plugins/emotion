@@ -47,10 +47,10 @@ def _plugin_context(tmp_path: Path) -> PluginContext:
 
 
 @pytest.mark.asyncio
-async def test_emotion_plugin_initializes_and_reads_state(tmp_path: Path) -> None:
+async def test_emotion_plugin_activates_and_reads_state(tmp_path: Path) -> None:
     plugin = EmotionPlugin()
     plugin.context = _plugin_context(tmp_path)
-    await plugin.initialize()
+    plugin.activate()
     try:
         plugin._on_feedback_recorded(
             ProactiveFeedbackRecorded(
@@ -76,7 +76,7 @@ async def test_emotion_plugin_initializes_and_reads_state(tmp_path: Path) -> Non
 async def test_mobile_projection_returns_state_and_real_influences(tmp_path: Path) -> None:
     plugin = EmotionPlugin()
     plugin.context = _plugin_context(tmp_path)
-    await plugin.initialize()
+    plugin.activate()
     try:
         base = datetime(2026, 7, 17, tzinfo=timezone.utc)
         db = module.open_db(tmp_path / "emotion" / "emotion.db")

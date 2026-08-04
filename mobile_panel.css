@@ -7,7 +7,7 @@
   --emotion-cautious-ink: #513600;
   --emotion-calm: #9db6dc;
   --emotion-calm-ink: #1c334f;
-  color: var(--m-on-surface);
+  color: var(--ak-color-text-primary);
   font-family: Roboto, "Noto Sans SC", system-ui, sans-serif;
   font-synthesis: none;
 }
@@ -27,13 +27,13 @@
 
 .emotion-mobile-loading {
   padding: 28px 4px;
-  color: var(--m-on-surface-variant);
+  color: var(--ak-color-text-secondary);
   font-size: 0.875rem;
   line-height: 1.5;
 }
 
 .emotion-mobile-loading.error {
-  color: var(--m-error);
+  color: var(--ak-color-status-error);
 }
 
 .emotion-mobile-overview {
@@ -96,8 +96,8 @@
   justify-content: center;
   border-radius: var(--m-shape-medium, 12px);
   padding: 14px;
-  color: var(--m-on-surface-variant);
-  background: var(--m-surface-container);
+  color: var(--ak-color-text-secondary);
+  background: var(--ak-color-bg-surface);
 }
 
 .emotion-mobile-signals > .emotion-mobile-threshold--raise_send_bar {
@@ -112,7 +112,7 @@
 
 .emotion-mobile-signals > .emotion-mobile-feedback {
   color: var(--emotion-current-ink);
-  background: color-mix(in oklch, var(--emotion-current) 68%, var(--m-surface-container));
+  background: color-mix(in oklch, var(--emotion-current) 68%, var(--ak-color-bg-surface));
 }
 
 .emotion-mobile-signals strong {
@@ -129,7 +129,7 @@
   gap: 6px;
   border: 0;
   padding: 0 4px;
-  color: var(--m-primary);
+  color: var(--ak-color-action-primary);
   background: transparent;
   font: inherit;
   font-size: 0.8125rem;
@@ -137,7 +137,7 @@
 }
 
 .emotion-mobile-metrics-trigger:focus-visible {
-  outline: 2px solid var(--m-primary);
+  outline: 2px solid var(--ak-color-action-primary);
   outline-offset: 2px;
 }
 
@@ -172,12 +172,12 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
   margin: 0;
-  background: var(--m-outline-variant);
+  background: var(--ak-color-border-default);
 }
 
 .emotion-mobile-metrics dl > div {
   padding: 11px 12px;
-  background: var(--m-surface-container-low);
+  background: var(--ak-color-bg-surface-low);
 }
 
 .emotion-mobile-metrics dt,
@@ -188,7 +188,7 @@
 }
 
 .emotion-mobile-metrics dt {
-  color: var(--m-on-surface-variant);
+  color: var(--ak-color-text-secondary);
 }
 
 .emotion-mobile-metrics dd {
@@ -216,19 +216,19 @@
 }
 
 .emotion-mobile-history header span {
-  color: var(--m-on-surface-variant);
+  color: var(--ak-color-text-secondary);
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;
 }
 
 .emotion-mobile-influence {
-  --emotion-influence: var(--m-on-surface-variant);
+  --emotion-influence: var(--ak-color-text-secondary);
   display: grid;
   min-height: 82px;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 5px 12px;
   align-items: center;
-  border-bottom: 1px solid var(--m-outline-variant);
+  border-bottom: 1px solid var(--ak-color-border-default);
   padding: 12px 2px;
 }
 
@@ -237,7 +237,7 @@
 }
 
 .emotion-mobile-influence--explicit_quote {
-  --emotion-influence: var(--m-tertiary, #745086);
+  --emotion-influence: var(--ak-color-status-trace);
 }
 
 .emotion-mobile-influence--no_topic_follow {
@@ -257,7 +257,7 @@
 }
 
 .emotion-mobile-influence time {
-  color: var(--m-on-surface-variant);
+  color: var(--ak-color-text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
@@ -278,7 +278,7 @@
 
 .emotion-mobile-empty {
   margin: 20px 2px;
-  color: var(--m-on-surface-variant);
+  color: var(--ak-color-text-secondary);
   font-size: 0.8125rem;
   line-height: 1.5;
 }

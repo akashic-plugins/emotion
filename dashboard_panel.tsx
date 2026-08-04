@@ -38,35 +38,42 @@ function _escape(value: unknown): string {
     .replaceAll("'", "&#39;");
 }
 
+function _effectLabel(value: unknown): string {
+  const effect = String(value || "");
+  if (effect === "raise_send_bar") return "提高发送阈值";
+  if (effect === "lower_send_bar") return "降低发送阈值";
+  return effect || "-";
+}
+
 function _toneCell(value: unknown): string {
   const text = String(value || "-");
   const tone = text === "raise_send_bar" ? "warning" : text === "lower_send_bar" ? "success" : "muted";
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(text)}</span>`;
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(_effectLabel(text))}</span>`;
 }
 
 function EmotionDetail(props: { item: Record<string, unknown> | null }): ReactElement {
   const item = props.item;
   if (!item) {
-    return <div className="detail-empty"><div className="detail-empty-title">VAD Effect</div><div className="detail-empty-text">点开一条 effect 后，这里会显示这次主动 tick 的情绪影响。</div></div>;
+    return <div className="detail-empty"><div className="detail-empty-title">情绪影响详情</div><div className="detail-empty-text">选择一条记录，查看这次主动任务的情绪影响。</div></div>;
   }
   return (
     <div className="detail-wrap">
       <div className="detail-toolbar">
         <div>
-          <div className="detail-title">VAD 主动影响</div>
+          <div className="detail-title">情绪对主动决策的影响</div>
           <div className="detail-subtext">{String(item.tick_id || "")}</div>
         </div>
       </div>
       <div className="detail-grid">
-        <DetailRow label="expected" value={<Chip tone={String(item.expected_effect) === "raise_send_bar" ? "warning" : "success"}>{String(item.expected_effect || "-")}</Chip>} />
-        <DetailRow label="tone" value={<code>{String(item.tone_label || "-")}</code>} />
-        <DetailRow label="V" value={<code>{_score(item.valence)}</code>} />
-        <DetailRow label="A" value={<code>{_score(item.arousal)}</code>} />
-        <DetailRow label="D" value={<code>{_score(item.dominance)}</code>} />
-        <DetailRow label="threshold" value={<code>{_score(item.base_threshold)} → {_score(item.final_threshold)}</code>} />
+        <DetailRow label="预期影响" value={<Chip tone={String(item.expected_effect) === "raise_send_bar" ? "warning" : "success"}>{_effectLabel(item.expected_effect)}</Chip>} />
+        <DetailRow label="语气" value={<code>{String(item.tone_label || "-")}</code>} />
+        <DetailRow label="愉悦度" value={<code>{_score(item.valence)}</code>} />
+        <DetailRow label="唤醒度" value={<code>{_score(item.arousal)}</code>} />
+        <DetailRow label="支配度" value={<code>{_score(item.dominance)}</code>} />
+        <DetailRow label="阈值变化" value={<code>{_score(item.base_threshold)} → {_score(item.final_threshold)}</code>} />
       </div>
-      <TextBlock title="Prompt Section" text={String(item.prompt_section || "")} />
-      <TextBlock title="Metadata" text={JSON.stringify(item.metadata || {}, null, 2)} />
+      <TextBlock title="提示词片段" text={String(item.prompt_section || "")} />
+      <TextBlock title="元数据" text={JSON.stringify(item.metadata || {}, null, 2)} />
     </div>
   );
 }
@@ -79,31 +86,31 @@ function TextBlock(props: { title: string; text: string }): ReactElement {
   return (
     <div className="detail-block">
       <div className="detail-label">{props.title}</div>
-    <div className="detail-content ak-plugin-pre-wrap">{props.text || "-"}</div>
+      <div className="detail-content ak-plugin-pre-wrap">{props.text || "-"}</div>
     </div>
   );
 }
 
 window.AkashicDashboard.registerPlugin({
   id: "emotion",
-  label: "Emotion",
-  viewLabel: "emotion",
+  label: "Emotion 情绪",
+  viewLabel: "情绪",
   pageSize: 50,
   rowKey: "id",
 
   countTitle(total: number): string {
-    return `共 ${total} 条 effect`;
+    return `共 ${total} 条情绪影响`;
   },
 
   columns: [
-    { key: "created_at", label: "Time", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
-    { key: "expected_effect", label: "Effect", width: 124, renderCell: _toneCell },
-    { key: "tone_label", label: "Tone", width: 136, cellClass: "mono" },
+    { key: "created_at", label: "时间", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
+    { key: "expected_effect", label: "影响", width: 132, renderCell: _toneCell },
+    { key: "tone_label", label: "语气", width: 112, cellClass: "mono" },
     { key: "valence", label: "V", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "arousal", label: "A", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "dominance", label: "D", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "threshold_delta", label: "Δ", width: 58, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
-    { key: "tick_id", label: "Tick", flex: true, cellClass: "mono content-preview", rawTitle: true },
+    { key: "tick_id", label: "任务", flex: true, cellClass: "mono content-preview", rawTitle: true },
   ],
 
   async getCount(): Promise<number | null> {

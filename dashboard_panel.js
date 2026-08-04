@@ -1,4 +1,4 @@
-// dashboard_panel.tsx
+// ../emotion/dashboard_panel.tsx
 import { Chip, api } from "@akashic/dashboard-ui";
 import { jsx, jsxs } from "react/jsx-runtime";
 function _score(value) {
@@ -37,43 +37,75 @@ function EmotionDetail(props) {
       /* @__PURE__ */ jsx("div", { className: "detail-empty-text", children: "\u9009\u62E9\u4E00\u6761\u8BB0\u5F55\uFF0C\u67E5\u770B\u8FD9\u6B21\u4E3B\u52A8\u4EFB\u52A1\u7684\u60C5\u7EEA\u5F71\u54CD\u3002" })
     ] });
   }
-  return /* @__PURE__ */ jsxs("div", { className: "detail-wrap", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-toolbar", children: /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsx("div", { className: "detail-title", children: "\u60C5\u7EEA\u5BF9\u4E3B\u52A8\u51B3\u7B56\u7684\u5F71\u54CD" }),
-      /* @__PURE__ */ jsx("div", { className: "detail-subtext", children: String(item.tick_id || "") })
-    ] }) }),
-    /* @__PURE__ */ jsxs("div", { className: "detail-grid", children: [
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u9884\u671F\u5F71\u54CD", value: /* @__PURE__ */ jsx(Chip, { tone: String(item.expected_effect) === "raise_send_bar" ? "warning" : "success", children: _effectLabel(item.expected_effect) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u8BED\u6C14", value: /* @__PURE__ */ jsx("code", { children: String(item.tone_label || "-") }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u6109\u60A6\u5EA6", value: /* @__PURE__ */ jsx("code", { children: _score(item.valence) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u5524\u9192\u5EA6", value: /* @__PURE__ */ jsx("code", { children: _score(item.arousal) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u652F\u914D\u5EA6", value: /* @__PURE__ */ jsx("code", { children: _score(item.dominance) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u9608\u503C\u53D8\u5316", value: /* @__PURE__ */ jsxs("code", { children: [
-        _score(item.base_threshold),
-        " \u2192 ",
-        _score(item.final_threshold)
-      ] }) })
+  const delta = typeof item.threshold_delta === "number" ? item.threshold_delta : null;
+  return /* @__PURE__ */ jsxs("main", { className: "emotion-detail", "aria-labelledby": "emotion-detail-title", children: [
+    /* @__PURE__ */ jsxs("header", { className: "emotion-detail__header", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("p", { children: "\u4E3B\u52A8\u51B3\u7B56\u8F93\u5165" }),
+        /* @__PURE__ */ jsx("h2", { id: "emotion-detail-title", children: "\u8FD9\u6B21\u60C5\u7EEA\u5982\u4F55\u6539\u53D8\u53D1\u9001\u9608\u503C" }),
+        /* @__PURE__ */ jsx("span", { children: String(item.tick_id || "\u672A\u5173\u8054\u4EFB\u52A1") })
+      ] }),
+      /* @__PURE__ */ jsx(Chip, { tone: String(item.expected_effect) === "raise_send_bar" ? "warning" : "success", children: _effectLabel(item.expected_effect) })
     ] }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "\u63D0\u793A\u8BCD\u7247\u6BB5", text: String(item.prompt_section || "") }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "\u5143\u6570\u636E", text: JSON.stringify(item.metadata || {}, null, 2) })
+    /* @__PURE__ */ jsxs("section", { className: "emotion-threshold", "aria-label": "\u9608\u503C\u53D8\u5316", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("span", { children: "\u539F\u59CB\u9608\u503C" }),
+        /* @__PURE__ */ jsx("strong", { children: _score(item.base_threshold) })
+      ] }),
+      /* @__PURE__ */ jsx("span", { className: "emotion-threshold__arrow", "aria-hidden": "true", children: "\u2192" }),
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("span", { children: "\u5E94\u7528\u60C5\u7EEA\u540E" }),
+        /* @__PURE__ */ jsx("strong", { children: _score(item.final_threshold) })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { className: `emotion-threshold__delta${delta !== null && delta > 0 ? " is-up" : " is-down"}`, children: [
+        /* @__PURE__ */ jsx("span", { children: "\u53D8\u5316" }),
+        /* @__PURE__ */ jsx("strong", { children: _delta(delta) })
+      ] })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "emotion-coordinates", "aria-labelledby": "emotion-coordinates-title", children: [
+      /* @__PURE__ */ jsxs("div", { className: "emotion-section-heading", children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("p", { children: "VAD \u6A21\u578B" }),
+          /* @__PURE__ */ jsx("h3", { id: "emotion-coordinates-title", children: "\u60C5\u7EEA\u5750\u6807" })
+        ] }),
+        /* @__PURE__ */ jsxs("span", { children: [
+          "\u8BED\u6C14\uFF1A",
+          String(item.tone_label || "\u672A\u6807\u6CE8")
+        ] })
+      ] }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u6109\u60A6\u5EA6", low: "\u6D88\u6781", high: "\u79EF\u6781", value: item.valence }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u5524\u9192\u5EA6", low: "\u5E73\u9759", high: "\u6FC0\u6D3B", value: item.arousal }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u652F\u914D\u5EA6", low: "\u53D7\u63A7", high: "\u4E3B\u5BFC", value: item.dominance })
+    ] }),
+    /* @__PURE__ */ jsx(TextDisclosure, { title: "\u67E5\u770B\u5199\u5165\u4E3B\u52A8\u6D41\u7A0B\u7684\u63D0\u793A\u8BCD", text: String(item.prompt_section || "") }),
+    /* @__PURE__ */ jsx(TextDisclosure, { title: "\u67E5\u770B\u6280\u672F\u5143\u6570\u636E", text: JSON.stringify(item.metadata || {}, null, 2) })
   ] });
 }
-function DetailRow(props) {
-  return /* @__PURE__ */ jsxs("div", { className: "detail-row", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-row-label", children: props.label }),
-    /* @__PURE__ */ jsx("div", { className: "detail-row-val", children: props.value })
+function VadGauge(props) {
+  const numeric = typeof props.value === "number" ? props.value : 0;
+  const position = Math.max(0, Math.min(100, (numeric + 1) / 2 * 100));
+  return /* @__PURE__ */ jsxs("div", { className: "emotion-gauge", children: [
+    /* @__PURE__ */ jsxs("div", { className: "emotion-gauge__label", children: [
+      /* @__PURE__ */ jsx("strong", { children: props.label }),
+      /* @__PURE__ */ jsx("code", { children: _score(props.value) })
+    ] }),
+    /* @__PURE__ */ jsx("div", { className: "emotion-gauge__track", "aria-hidden": "true", children: /* @__PURE__ */ jsx("i", { style: { left: `${position}%` } }) }),
+    /* @__PURE__ */ jsxs("div", { className: "emotion-gauge__ends", children: [
+      /* @__PURE__ */ jsx("span", { children: props.low }),
+      /* @__PURE__ */ jsx("span", { children: props.high })
+    ] })
   ] });
 }
-function TextBlock(props) {
-  return /* @__PURE__ */ jsxs("div", { className: "detail-block", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-label", children: props.title }),
-    /* @__PURE__ */ jsx("div", { className: "detail-content ak-plugin-pre-wrap", children: props.text || "-" })
+function TextDisclosure(props) {
+  return /* @__PURE__ */ jsxs("details", { className: "emotion-disclosure", children: [
+    /* @__PURE__ */ jsx("summary", { children: props.title }),
+    /* @__PURE__ */ jsx("pre", { children: props.text || "-" })
   ] });
 }
 window.AkashicDashboard.registerPlugin({
   id: "emotion",
-  label: "Emotion \u60C5\u7EEA",
-  viewLabel: "\u60C5\u7EEA",
+  label: "\u60C5\u7EEA\u51B3\u7B56",
+  viewLabel: "\u60C5\u7EEA\u51B3\u7B56",
   pageSize: 50,
   rowKey: "id",
   countTitle(total) {
@@ -82,11 +114,10 @@ window.AkashicDashboard.registerPlugin({
   columns: [
     { key: "created_at", label: "\u65F6\u95F4", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "expected_effect", label: "\u5F71\u54CD", width: 132, renderCell: _toneCell },
-    { key: "tone_label", label: "\u8BED\u6C14", width: 112, cellClass: "mono" },
-    { key: "valence", label: "V", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "arousal", label: "A", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "dominance", label: "D", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "threshold_delta", label: "\u0394", width: 58, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
+    { key: "tone_label", label: "\u8BED\u6C14", width: 112 },
+    { key: "valence", label: "\u6109\u60A6", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "arousal", label: "\u5524\u9192", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "threshold_delta", label: "\u9608\u503C\u53D8\u5316", width: 82, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
     { key: "tick_id", label: "\u4EFB\u52A1", flex: true, cellClass: "mono content-preview", rawTitle: true }
   ],
   async getCount() {

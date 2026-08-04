@@ -56,45 +56,68 @@ function EmotionDetail(props: { item: Record<string, unknown> | null }): ReactEl
   if (!item) {
     return <div className="detail-empty"><div className="detail-empty-title">情绪影响详情</div><div className="detail-empty-text">选择一条记录，查看这次主动任务的情绪影响。</div></div>;
   }
+  const delta = typeof item.threshold_delta === "number" ? item.threshold_delta : null;
   return (
-    <div className="detail-wrap">
-      <div className="detail-toolbar">
+    <main className="emotion-detail" aria-labelledby="emotion-detail-title">
+      <header className="emotion-detail__header">
         <div>
-          <div className="detail-title">情绪对主动决策的影响</div>
-          <div className="detail-subtext">{String(item.tick_id || "")}</div>
+          <p>主动决策输入</p>
+          <h2 id="emotion-detail-title">这次情绪如何改变发送阈值</h2>
+          <span>{String(item.tick_id || "未关联任务")}</span>
         </div>
-      </div>
-      <div className="detail-grid">
-        <DetailRow label="预期影响" value={<Chip tone={String(item.expected_effect) === "raise_send_bar" ? "warning" : "success"}>{_effectLabel(item.expected_effect)}</Chip>} />
-        <DetailRow label="语气" value={<code>{String(item.tone_label || "-")}</code>} />
-        <DetailRow label="愉悦度" value={<code>{_score(item.valence)}</code>} />
-        <DetailRow label="唤醒度" value={<code>{_score(item.arousal)}</code>} />
-        <DetailRow label="支配度" value={<code>{_score(item.dominance)}</code>} />
-        <DetailRow label="阈值变化" value={<code>{_score(item.base_threshold)} → {_score(item.final_threshold)}</code>} />
-      </div>
-      <TextBlock title="提示词片段" text={String(item.prompt_section || "")} />
-      <TextBlock title="元数据" text={JSON.stringify(item.metadata || {}, null, 2)} />
+        <Chip tone={String(item.expected_effect) === "raise_send_bar" ? "warning" : "success"}>{_effectLabel(item.expected_effect)}</Chip>
+      </header>
+
+      <section className="emotion-threshold" aria-label="阈值变化">
+        <div><span>原始阈值</span><strong>{_score(item.base_threshold)}</strong></div>
+        <span className="emotion-threshold__arrow" aria-hidden="true">→</span>
+        <div><span>应用情绪后</span><strong>{_score(item.final_threshold)}</strong></div>
+        <div className={`emotion-threshold__delta${delta !== null && delta > 0 ? " is-up" : " is-down"}`}>
+          <span>变化</span><strong>{_delta(delta)}</strong>
+        </div>
+      </section>
+
+      <section className="emotion-coordinates" aria-labelledby="emotion-coordinates-title">
+        <div className="emotion-section-heading">
+          <div><p>VAD 模型</p><h3 id="emotion-coordinates-title">情绪坐标</h3></div>
+          <span>语气：{String(item.tone_label || "未标注")}</span>
+        </div>
+        <VadGauge label="愉悦度" low="消极" high="积极" value={item.valence} />
+        <VadGauge label="唤醒度" low="平静" high="激活" value={item.arousal} />
+        <VadGauge label="支配度" low="受控" high="主导" value={item.dominance} />
+      </section>
+
+      <TextDisclosure title="查看写入主动流程的提示词" text={String(item.prompt_section || "")} />
+      <TextDisclosure title="查看技术元数据" text={JSON.stringify(item.metadata || {}, null, 2)} />
+    </main>
+  );
+}
+
+function VadGauge(props: { label: string; low: string; high: string; value: unknown }): ReactElement {
+  const numeric = typeof props.value === "number" ? props.value : 0;
+  const position = Math.max(0, Math.min(100, ((numeric + 1) / 2) * 100));
+  return (
+    <div className="emotion-gauge">
+      <div className="emotion-gauge__label"><strong>{props.label}</strong><code>{_score(props.value)}</code></div>
+      <div className="emotion-gauge__track" aria-hidden="true"><i style={{ left: `${position}%` }} /></div>
+      <div className="emotion-gauge__ends"><span>{props.low}</span><span>{props.high}</span></div>
     </div>
   );
 }
 
-function DetailRow(props: { label: string; value: ReactElement }): ReactElement {
-  return <div className="detail-row"><div className="detail-row-label">{props.label}</div><div className="detail-row-val">{props.value}</div></div>;
-}
-
-function TextBlock(props: { title: string; text: string }): ReactElement {
+function TextDisclosure(props: { title: string; text: string }): ReactElement {
   return (
-    <div className="detail-block">
-      <div className="detail-label">{props.title}</div>
-      <div className="detail-content ak-plugin-pre-wrap">{props.text || "-"}</div>
-    </div>
+    <details className="emotion-disclosure">
+      <summary>{props.title}</summary>
+      <pre>{props.text || "-"}</pre>
+    </details>
   );
 }
 
 window.AkashicDashboard.registerPlugin({
   id: "emotion",
-  label: "Emotion 情绪",
-  viewLabel: "情绪",
+  label: "情绪决策",
+  viewLabel: "情绪决策",
   pageSize: 50,
   rowKey: "id",
 
@@ -105,11 +128,10 @@ window.AkashicDashboard.registerPlugin({
   columns: [
     { key: "created_at", label: "时间", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "expected_effect", label: "影响", width: 132, renderCell: _toneCell },
-    { key: "tone_label", label: "语气", width: 112, cellClass: "mono" },
-    { key: "valence", label: "V", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "arousal", label: "A", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "dominance", label: "D", width: 58, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "threshold_delta", label: "Δ", width: 58, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
+    { key: "tone_label", label: "语气", width: 112 },
+    { key: "valence", label: "愉悦", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "arousal", label: "唤醒", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "threshold_delta", label: "阈值变化", width: 82, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
     { key: "tick_id", label: "任务", flex: true, cellClass: "mono content-preview", rawTitle: true },
   ],
 

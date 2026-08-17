@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from pathlib import Path
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 from agent.plugin_composition import (
     BACKGROUND_JOBS,
@@ -11,41 +11,37 @@ from agent.plugin_composition import (
     Context,
     CoreEvent,
     CoreEventTrigger,
-)
-
-from agent.plugins import (
-    EventTrigger,
-    MobileUiContribution,
+    MobileUiDefinition,
     MobileUiNavigation,
-    Plugin,
-    PluginJobContext,
-    PluginJobSpec,
-    tool,
+    MobileUiRpcInvalidRequest,
+    PROACTIVE_COMPONENTS,
+    ProactiveModuleDefinition,
+    UI_SLOTS,
 )
-from agent.plugins.mobile_ui import MobileUiRpcInvalidRequest
-from bus.events_proactive import ProactiveFeedbackRecorded
-from bus.events_lifecycle import DriftFinished
+from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
+from bus.events_lifecycle import DriftFinished, TurnCommitted
 from proactive_v2.frame import ProactiveFrame
 
 from .db import (
     apply_feedback,
     build_effect,
     commit_domain_effect,
-    get_state,
     lookup_domain_effect,
     lookup_domain_effect_path,
     open_db,
 )
 from .dashboard import EmotionDashboardReader
 
-logger = logging.getLogger("plugin.emotion")
-
 api_version = 3
 name = "emotion"
-version = "1.1.0"
-inject = (BACKGROUND_JOBS,)
+version = "3.0.0"
+desc = "Proactive VAD state and feedback preference projection."
+inject = (BACKGROUND_JOBS, PROACTIVE_COMPONENTS, UI_SLOTS)
 workspace_roots = ("emotion",)
+drift_skill_roots = ("drift/skills",)
+dashboard_module = "dashboard.py"
 _v3_emotion_root: Path | None = None
+_v3_emotion_module: "EmotionProjectionModule | None" = None
 
 _FEEDBACK_CONTEXT_SKILL = "feedback-preference-context"
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
@@ -101,14 +97,32 @@ _MERGE_PROACTIVE_CONTEXT_PROMPT = """\
 
 
 async def apply(ctx: Context, config: object) -> None:
-    """登记 Emotion 的 generation-bound proactive merge job。"""
+    """登记 Emotion 的 proactive module、typed Turn observer、job 与 UI。"""
 
     # 1. 只冻结 Core 投影的 generation-local 数据根，不打开数据库或调用模型。
     del config
-    global _v3_emotion_root
+    global _v3_emotion_module, _v3_emotion_root
     _v3_emotion_root = ctx.workspace_root("emotion")
+    emotion_root = _v3_emotion_root
+    _v3_emotion_module = EmotionProjectionModule(emotion_root)
 
-    # 2. JobHost 独占 event admission、LLM lease、effect receipt 与文档提交。
+    # 2. Proactive module 只在 formal domain-effect facade 中提交 SQLite 状态。
+    await ctx.require(PROACTIVE_COMPONENTS).register(
+        ctx,
+        ProactiveModuleDefinition(
+            slot="proactive.prompt.emotion",
+            lifecycle_id="default.proactive.frame.v1",
+            produces=(
+                "proactive:prompt:system_bottom:emotion",
+                "proactive:effect:emotion",
+            ),
+            handler_export="run_emotion_prompt_v3",
+            domain_effect="emotion.state",
+            domain_effect_lookup_export="lookup_emotion_domain_effect_v3",
+        ),
+    )
+
+    # 3. JobHost 独占 event admission、LLM lease、effect receipt 与文档提交。
     await ctx.require(BACKGROUND_JOBS).register(
         ctx,
         BackgroundJobDefinition(
@@ -120,6 +134,201 @@ async def apply(ctx: Context, config: object) -> None:
             domain_effect_lookup_export="lookup_emotion_domain_effect_v3",
             model_role="agent",
         ),
+    )
+
+    # 4. TurnCommitted 是反馈唯一的 typed owner；listener 固定当前 Root。
+    def on_turn_committed(event: TurnCommitted) -> None:
+        _on_turn_committed(event, root=emotion_root)
+
+    await ctx.on(AFTER_TURN_COMMITTED, on_turn_committed)
+
+    # 5. Mobile 只读查询与静态资源绑定到同一个 generation Root。
+    def mobile_query(
+        method: str,
+        payload: dict[str, object],
+        *,
+        session_id: str | None,
+        turn_id: str | None,
+    ) -> dict[str, object]:
+        return _mobile_ui_query(
+            method,
+            payload,
+            session_id=session_id,
+            turn_id=turn_id,
+            root=emotion_root,
+        )
+
+    await ctx.require(UI_SLOTS).register_mobile(
+        ctx,
+        MobileUiDefinition(
+            module="mobile_panel.js",
+            stylesheet="mobile_panel.css",
+            navigation=MobileUiNavigation(
+                label="主动状态",
+                description="反馈如何改变 Agent 的语气和主动发送把握",
+            ),
+        ),
+        query=mobile_query,
+    )
+
+
+class EmotionProjectionModule:
+    """Build one proactive emotion projection and submit its domain receipt."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    async def run(self, context: object, frame: ProactiveFrame) -> ProactiveFrame:
+        """Persist one formal frame effect through Core's exact domain facade."""
+
+        # 1. Resolve the only allowed domain effect and derive stable frame inputs.
+        effects = getattr(context, "domain_effects", None)
+        if effects is None or not callable(getattr(effects, "run", None)):
+            raise RuntimeError(
+                "emotion proactive module 缺少 Core-owned domain effects facade"
+            )
+        session_key = str(
+            frame.slots.get("proactive:session_key") or frame.input.session_key
+        )
+        base_threshold = float(
+            frame.slots.get("proactive:base_judge_send_threshold") or 0.60
+        )
+        last_user_at = frame.slots.get("proactive:last_user_at")
+        if last_user_at is not None and not hasattr(last_user_at, "tzinfo"):
+            raise TypeError("emotion last_user_at 必须是 datetime 或 None")
+        result: dict[str, Any] = {}
+
+        # 2. Core signs the effect only after this SQLite transaction has a durable receipt.
+        def transaction(effect_context: object) -> None:
+            del effect_context
+            conn = open_db(self._root / "emotion.db")
+            try:
+                result["effect"] = build_effect(
+                    conn,
+                    tick_id=f"frame:{frame.input.started_at.isoformat()}",
+                    session_key=session_key,
+                    now_utc=frame.input.started_at,
+                    last_user_at=cast(Any, last_user_at),
+                    base_threshold=base_threshold,
+                )
+            finally:
+                conn.close()
+
+        await effects.run("emotion.state", transaction)
+        effect = result.get("effect")
+        if not isinstance(effect, dict):
+            raise RuntimeError("emotion domain effect 未返回 frame projection")
+        frame.slots["proactive:prompt:system_bottom:emotion"] = str(
+            effect.get("prompt_section") or ""
+        )
+        frame.slots["proactive:effect:emotion"] = effect
+        return frame
+
+
+async def run_emotion_prompt_v3(
+    context: object,
+    frame: ProactiveFrame,
+) -> ProactiveFrame:
+    """Run the exact-generation emotion proactive module."""
+
+    module = _v3_emotion_module
+    if module is None:
+        raise RuntimeError("emotion v3 generation 尚未完成 apply")
+    return await module.run(context, frame)
+
+
+def _on_turn_committed(event: TurnCommitted, *, root: Path | None = None) -> None:
+    """Project one typed committed Turn into Emotion's idempotent SQLite state."""
+
+    feedback = _feedback_from_turn(event)
+    if feedback is None:
+        return
+    root = _require_v3_emotion_root() if root is None else root
+    conn = open_db(root / "emotion.db")
+    try:
+        apply_feedback(
+            conn,
+            source_event_id=feedback["source_event_id"],
+            session_key=event.session_key,
+            feedback_type=feedback["feedback_type"],
+            confidence=feedback["confidence"],
+            payload=feedback["payload"],
+        )
+    finally:
+        conn.close()
+
+
+def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
+    """Read an optional typed feedback result, with explicit quote as the local fallback."""
+
+    raw = event.extra.get("proactive_feedback")
+    if isinstance(raw, Mapping):
+        feedback_type = raw.get("feedback_type")
+        confidence = raw.get("confidence")
+        if isinstance(feedback_type, str) and isinstance(confidence, str):
+            source = raw.get("event_id") or event.turn_id or event.persisted_user_message_id
+            if isinstance(source, str) and source:
+                payload = {
+                    "feedback_event_id": str(source),
+                    "user_message_id": event.persisted_user_message_id,
+                    "assistant_message_id": event.assistant_message_id,
+                    "proactive_message_id": raw.get("proactive_message_id"),
+                    "feedback_type": feedback_type,
+                    "confidence": confidence,
+                    "pua_score": raw.get("pua_score"),
+                    "lag_seconds": raw.get("lag_seconds"),
+                    "matched_by": raw.get("matched_by", "typed_turn"),
+                }
+                return {
+                    "source_event_id": f"proactive_feedback:{source}",
+                    "feedback_type": feedback_type,
+                    "confidence": confidence,
+                    "payload": payload,
+                }
+
+    # A quote is already an explicit feedback signal carried by the committed user message.
+    marker = "【你当前新消息】"
+    source = event.turn_id or event.persisted_user_message_id
+    if marker not in event.input_message or not isinstance(source, str) or not source:
+        return None
+    payload = {
+        "feedback_event_id": source,
+        "user_message_id": event.persisted_user_message_id,
+        "assistant_message_id": event.assistant_message_id,
+        "proactive_message_id": None,
+        "feedback_type": "explicit_quote",
+        "confidence": "gold",
+        "pua_score": 1.0,
+        "lag_seconds": None,
+        "matched_by": "explicit_quote",
+    }
+    return {
+        "source_event_id": f"proactive_feedback:{source}",
+        "feedback_type": "explicit_quote",
+        "confidence": "gold",
+        "payload": payload,
+    }
+
+
+def _mobile_ui_query(
+    method: str,
+    payload: dict[str, object],
+    *,
+    session_id: str | None,
+    turn_id: str | None,
+    root: Path | None = None,
+) -> dict[str, object]:
+    """Return a read-only bounded Emotion mobile projection."""
+
+    _ = session_id, turn_id
+    if method != "emotion.bootstrap":
+        raise MobileUiRpcInvalidRequest(f"未知 emotion 移动方法: {method}")
+    limit = payload.get("limit", 30)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+        raise MobileUiRpcInvalidRequest("limit 必须是 1 到 50 的整数")
+    emotion_root = _require_v3_emotion_root() if root is None else root
+    return EmotionDashboardReader(emotion_root).get_mobile_bootstrap(
+        limit=limit
     )
 
 
@@ -197,215 +406,3 @@ def _require_v3_emotion_root() -> Path:
     if _v3_emotion_root is None:
         raise RuntimeError("emotion v3 generation 尚未绑定 workspace root")
     return _v3_emotion_root
-
-
-class EmotionProactivePromptModule:
-    slot = "proactive.prompt.emotion"
-    produces = (
-        "proactive:prompt:system_bottom:emotion",
-        "proactive:effect:emotion",
-    )
-
-    def __init__(self, plugin: "EmotionPlugin") -> None:
-        self._plugin = plugin
-
-    async def run(self, frame: ProactiveFrame) -> ProactiveFrame:
-        effect = self._plugin.build_proactive_prompt_effect(frame)
-        if effect is None:
-            return frame
-        frame.slots["proactive:prompt:system_bottom:emotion"] = str(
-            effect.get("prompt_section") or ""
-        )
-        frame.slots["proactive:effect:emotion"] = effect
-        return frame
-
-
-class EmotionPlugin(Plugin):
-    api_version = 2
-    @classmethod
-    def dashboard_module(cls) -> str | None:
-        return "dashboard.py"
-
-    @classmethod
-    def mobile_ui(cls) -> MobileUiContribution:
-        return MobileUiContribution(
-            module="mobile_panel.js",
-            stylesheet="mobile_panel.css",
-            navigation=MobileUiNavigation(
-                label="主动状态",
-                description="反馈如何改变 Agent 的语气和主动发送把握",
-            ),
-        )
-
-    name = "emotion"
-    version = "1.1.0"
-
-    @classmethod
-    def drift_skill_roots(cls) -> tuple[str, ...]:
-        return ("drift/skills",)
-
-    def activate(self) -> None:
-        workspace = self.context.workspace
-        if workspace is None:
-            logger.warning("emotion 插件缺少 workspace，跳过加载")
-            return
-        self._db_path = workspace / "emotion" / "emotion.db"
-        conn = open_db(self._db_path)
-        conn.close()
-        self.context.event_bus.on(ProactiveFeedbackRecorded, self._on_feedback_recorded)
-
-    async def terminate(self) -> None:
-        return None
-
-    def mobile_ui_query(
-        self,
-        method: str,
-        payload: dict[str, object],
-        *,
-        session_id: str | None,
-        turn_id: str | None,
-    ) -> dict[str, object]:
-        """返回反馈如何调节主动状态的移动投影。"""
-
-        # 1. 在插件 RPC 边界校验方法与列表上限
-        _ = session_id, turn_id
-        if method != "emotion.bootstrap":
-            raise MobileUiRpcInvalidRequest(f"未知 emotion 移动方法: {method}")
-        workspace = self.context.workspace
-        if workspace is None:
-            raise RuntimeError("emotion 移动看板缺少 workspace")
-        limit = payload.get("limit", 30)
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
-            raise MobileUiRpcInvalidRequest("limit 必须是 1 到 50 的整数")
-
-        # 2. 单个 SQLite 快照返回首屏全部区域
-        return EmotionDashboardReader(workspace).get_mobile_bootstrap(limit=limit)
-
-    def proactive_modules(self) -> list[object]:
-        return [EmotionProactivePromptModule(self)]
-
-    def jobs(self) -> list[PluginJobSpec]:
-        return [
-            PluginJobSpec(
-                id="merge_proactive_pending",
-                triggers=[EventTrigger(DriftFinished)],
-                handler=self.merge_proactive_pending,
-            )
-        ]
-
-    async def merge_proactive_pending(self, ctx: PluginJobContext) -> None:
-        event = ctx.event
-        if not isinstance(event, DriftFinished):
-            return
-        if event.skill_name != _FEEDBACK_CONTEXT_SKILL or event.status != "completed":
-            return
-        workspace = self.context.workspace
-        if workspace is None:
-            return
-
-        pending_path = workspace / "proactive_pending.md"
-        context_path = workspace / "PROACTIVE_CONTEXT.md"
-        pending = self._read_text(pending_path).strip()
-        if not pending or "- [ ]" not in pending:
-            return
-
-        current_context = self._read_text(context_path).strip()
-        if not current_context:
-            current_context = _PROACTIVE_CONTEXT_TEMPLATE.strip()
-        prompt = _MERGE_PROACTIVE_CONTEXT_PROMPT.format(
-            current_context=current_context,
-            pending=pending,
-        )
-        merged = await ctx.llm.generate_text(
-            system=_MERGE_PROACTIVE_CONTEXT_SYSTEM,
-            prompt=prompt,
-            max_tokens=4096,
-        )
-        if not merged:
-            return
-        _ = context_path.write_text(merged.strip() + "\n", encoding="utf-8")
-        _ = pending_path.write_text("", encoding="utf-8")
-        logger.info("emotion proactive pending 已合并到 PROACTIVE_CONTEXT.md")
-
-    @staticmethod
-    def _read_text(path: Path) -> str:
-        if not path.exists():
-            return ""
-        return path.read_text(encoding="utf-8")
-
-    def build_proactive_prompt_effect(
-        self,
-        frame: ProactiveFrame,
-    ) -> dict[str, Any] | None:
-        db_path = getattr(self, "_db_path", None)
-        if db_path is None:
-            return None
-        conn = open_db(Path(db_path))
-        try:
-            return build_effect(
-                conn,
-                tick_id=f"frame:{frame.input.started_at.isoformat()}",
-                session_key=str(
-                    frame.slots.get("proactive:session_key")
-                    or frame.input.session_key
-                ),
-                now_utc=frame.input.started_at,
-                last_user_at=frame.slots.get("proactive:last_user_at"),
-                base_threshold=float(
-                    frame.slots.get("proactive:base_judge_send_threshold") or 0.60
-                ),
-            )
-        finally:
-            conn.close()
-
-    def _on_feedback_recorded(self, event: ProactiveFeedbackRecorded) -> None:
-        db_path = getattr(self, "_db_path", None)
-        if db_path is None:
-            return
-        payload: dict[str, Any] = {
-            "feedback_event_id": event.event_id,
-            "user_message_id": event.user_message_id,
-            "assistant_message_id": event.assistant_message_id,
-            "proactive_message_id": event.proactive_message_id,
-            "feedback_type": event.feedback_type,
-            "confidence": event.confidence,
-            "pua_score": event.pua_score,
-            "lag_seconds": event.lag_seconds,
-            "matched_by": event.matched_by,
-        }
-        conn = open_db(Path(db_path))
-        try:
-            _ = apply_feedback(
-                conn,
-                source_event_id=f"proactive_feedback:{event.event_id}",
-                session_key=event.session_key,
-                feedback_type=event.feedback_type,
-                confidence=event.confidence,
-                payload=payload,
-            )
-        finally:
-            conn.close()
-
-    @tool(
-        "get_emotion_state",
-        risk="read-only",
-        search_hint="查询 proactive VAD 情绪状态",
-    )
-    async def get_emotion_state(self, event: Any) -> dict[str, Any]:
-        """查询 proactive VAD 情绪状态。"""
-        _ = event
-        db_path = getattr(self, "_db_path", None)
-        if db_path is None:
-            return {"available": False}
-        conn = open_db(Path(db_path))
-        try:
-            state = get_state(conn)
-        finally:
-            conn.close()
-        return {
-            "available": True,
-            "valence": state.valence,
-            "arousal": state.arousal,
-            "dominance": state.dominance,
-            "updated_at": state.updated_at,
-        }

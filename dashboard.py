@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import sqlite3
 import threading
@@ -9,13 +8,14 @@ from typing import Any, Iterator
 
 from fastapi import FastAPI
 
+from agent.plugin_composition import DashboardContext
+
 from .db import EmotionState, describe_behavior
 
 
 class EmotionDashboardReader:
-    def __init__(self, workspace: Path) -> None:
-        self.db_path = workspace / "emotion" / "emotion.db"
-        self.sessions_db_path = workspace / "sessions.db"
+    def __init__(self, emotion_root: Path) -> None:
+        self.db_path = emotion_root / "emotion.db"
         self._lock = threading.RLock()
 
     def get_overview(self) -> dict[str, Any]:
@@ -36,11 +36,10 @@ class EmotionDashboardReader:
             with _connect(self.db_path) as db:
                 rows = _influence_rows(db, safe_limit)
 
-        # 2. 用事件已持有的消息 ID 补齐可读预览
+        # 2. 事件 payload 已经是插件自己的完整投影；不越过 Core workspace 边界读 sessions.db。
         decoded = [_decode_influence(row) for row in rows]
-        previews = self._load_user_previews(decoded)
         for item in decoded:
-            item["user_preview"] = _preview(previews.get(str(item["user_message_id"])))
+            item["user_preview"] = ""
         return decoded
 
     def get_mobile_bootstrap(self, *, limit: int = 30) -> dict[str, Any]:
@@ -56,10 +55,9 @@ class EmotionDashboardReader:
                 overview = _overview_from_db(db)
                 decoded = [_decode_influence(row) for row in _influence_rows(db, safe_limit)]
 
-        # 2. 会话预览是独立数据源，只补充文案，不参与 emotion 状态一致性
-        previews = self._load_user_previews(decoded)
+        # 2. Mobile 只返回 Emotion 自有投影，不取得 Session 持久化 owner。
         for item in decoded:
-            item["user_preview"] = _preview(previews.get(str(item["user_message_id"])))
+            item["user_preview"] = ""
         return {"overview": overview, "items": decoded}
 
     def list_effects(
@@ -98,22 +96,10 @@ class EmotionDashboardReader:
                 ).fetchone()
         return _decode_effect(row) if row is not None else None
 
-    def _load_user_previews(self, items: list[dict[str, Any]]) -> dict[str, str]:
-        if not items or not self.sessions_db_path.exists():
-            return {}
-        ids = list(dict.fromkeys(str(item["user_message_id"]) for item in items))
-        placeholders = ",".join("?" for _ in ids)
-        with _connect(self.sessions_db_path) as db:
-            rows = db.execute(
-                f"SELECT id, content FROM messages WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        return {str(row["id"]): str(row["content"] or "") for row in rows}
+def register(app: FastAPI, context: DashboardContext) -> None:
+    """Register Emotion read-only routes against the exact v3 workspace root."""
 
-
-def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> None:
-    _ = plugin_dir
-    reader = EmotionDashboardReader(workspace)
+    reader = EmotionDashboardReader(context.workspace_root("emotion"))
 
     @app.get("/api/dashboard/emotion/overview")
     def get_emotion_overview() -> dict[str, Any]:
@@ -246,10 +232,3 @@ def _decode_influence(row: sqlite3.Row) -> dict[str, Any]:
     metadata = json.loads(str(payload.pop("payload_json")))
     payload["user_message_id"] = str(metadata["user_message_id"])
     return payload
-
-
-def _preview(value: str | None, limit: int = 180) -> str:
-    text = str(value or "").replace("\n", " ").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."

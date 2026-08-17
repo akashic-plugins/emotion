@@ -8,7 +8,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from proactive_v2.energy import compute_energy
+
+def compute_energy(
+    last_user_at: datetime | None,
+    now: datetime | None = None,
+    *,
+    alpha: float = 0.50,
+    beta: float = 0.35,
+    gamma: float = 0.15,
+    tau1_min: float = 30.0,
+    tau2_min: float = 240.0,
+    tau3_min: float = 2880.0,
+) -> float:
+    """Return the current interaction energy without depending on Core internals."""
+
+    if last_user_at is None:
+        return 0.0
+    now = now or datetime.now(timezone.utc)
+    minutes = max(0.0, (now - last_user_at).total_seconds() / 60.0)
+    return (
+        alpha * math.exp(-minutes / tau1_min)
+        + beta * math.exp(-minutes / tau2_min)
+        + gamma * math.exp(-minutes / tau3_min)
+    )
 
 
 @dataclass(frozen=True)

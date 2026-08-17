@@ -33,7 +33,10 @@ from agent.plugin_composition.proactive import (
 from agent.plugin_composition.ui_slots import PluginUiSlots
 from agent.plugins.generation_activity_host import ActivityHost
 from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
-from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
+from agent.plugins.generation_proactive_host import (
+    ProactiveActivityAdapter,
+    ProactiveModuleOutcome,
+)
 from agent.plugins.manager import PluginManager
 from agent.plugins.proactive_documents import (
     ProactiveDocumentDigests,
@@ -41,7 +44,9 @@ from agent.plugins.proactive_documents import (
 )
 from bus.events_lifecycle import DriftFinished, TurnCommitted
 from bus.event_bus import EventBus
-from proactive_v2.frame import ProactiveFrame, ProactiveTickInput
+from proactive_v2.frame import ProactiveTickInput
+
+ProactiveFrame = ProactiveModuleOutcome
 
 
 def _load_plugin_module():
@@ -143,8 +148,12 @@ def test_module_exports_pure_v3_contract() -> None:
     module_file = module.__file__
     assert isinstance(module_file, str)
     source = Path(module_file).read_text(encoding="utf-8")
+    db_source = Path(module_file).with_name("db.py").read_text(encoding="utf-8")
     assert "class EmotionPlugin" not in source
     assert "ProactiveFeedbackRecorded" not in source
+    production_source = f"{source}\n{db_source}"
+    assert "proactive_v2.frame" not in production_source
+    assert "proactive_v2.energy" not in production_source
     assert "EventBus" not in source
     assert "from agent.plugins import" not in source
 

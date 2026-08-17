@@ -21,7 +21,10 @@ from agent.plugin_composition import (
 )
 from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
 from bus.events_lifecycle import DriftFinished, TurnCommitted
-from proactive_v2.frame import ProactiveFrame
+from agent.plugins.generation_proactive_host import (
+    ProactiveModuleContext,
+    ProactiveModuleOutcome,
+)
 
 from .db import (
     apply_feedback,
@@ -181,7 +184,11 @@ class EmotionProjectionModule:
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    async def run(self, context: object, frame: ProactiveFrame) -> ProactiveFrame:
+    async def run(
+        self,
+        context: ProactiveModuleContext,
+        frame: ProactiveModuleOutcome,
+    ) -> ProactiveModuleOutcome:
         """Persist one formal frame effect through Core's exact domain facade."""
 
         # 1. Resolve the only allowed domain effect and derive stable frame inputs.
@@ -272,9 +279,9 @@ def _effect_digest(effect: Mapping[str, object]) -> str:
 
 
 async def run_emotion_prompt_v3(
-    context: object,
-    frame: ProactiveFrame,
-) -> ProactiveFrame:
+    context: ProactiveModuleContext,
+    frame: ProactiveModuleOutcome,
+) -> ProactiveModuleOutcome:
     """Run the exact-generation emotion proactive module."""
 
     module = _v3_emotion_module

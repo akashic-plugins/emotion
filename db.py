@@ -83,6 +83,27 @@ def open_db(path: Path) -> sqlite3.Connection:
             payload_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS emotion_feedback_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            source_event_id TEXT NOT NULL UNIQUE,
+            session_key TEXT NOT NULL,
+            user_message_id TEXT,
+            assistant_message_id TEXT,
+            proactive_message_id TEXT,
+            feedback_type TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            pa_score REAL,
+            pua_score REAL,
+            lag_seconds INTEGER,
+            candidate_count INTEGER,
+            matched_by TEXT,
+            reason TEXT,
+            user_content_preview TEXT,
+            assistant_content_preview TEXT,
+            proactive_content_preview TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS emotion_effects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -301,9 +322,65 @@ def apply_feedback(
         )
     except sqlite3.IntegrityError:
         return before
+    if feedback_type in {"topic_follow", "explicit_quote"}:
+        _insert_feedback_sample(
+            conn,
+            source_event_id=source_event_id,
+            session_key=session_key,
+            feedback_type=feedback_type,
+            confidence=confidence,
+            payload=payload,
+        )
     _save_state(conn, after)
     conn.commit()
     return after
+
+
+def _insert_feedback_sample(
+    conn: sqlite3.Connection,
+    *,
+    source_event_id: str,
+    session_key: str,
+    feedback_type: str,
+    confidence: str,
+    payload: dict[str, Any],
+) -> None:
+    """Persist the bounded typed-Turn sample consumed by the Emotion Drift skill."""
+
+    _ = conn.execute(
+        """
+        INSERT INTO emotion_feedback_samples (
+            source_event_id, session_key, user_message_id,
+            assistant_message_id, proactive_message_id, feedback_type,
+            confidence, pa_score, pua_score, lag_seconds, candidate_count,
+            matched_by, reason, user_content_preview,
+            assistant_content_preview, proactive_content_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_event_id,
+            session_key,
+            _payload_text(payload, "user_message_id"),
+            _payload_text(payload, "assistant_message_id"),
+            _payload_text(payload, "proactive_message_id"),
+            feedback_type,
+            confidence,
+            payload.get("pa_score"),
+            payload.get("pua_score"),
+            payload.get("lag_seconds"),
+            payload.get("candidate_count"),
+            _payload_text(payload, "matched_by"),
+            _payload_text(payload, "reason"),
+            _payload_text(payload, "user_content_preview"),
+            _payload_text(payload, "assistant_content_preview"),
+            _payload_text(payload, "proactive_content_preview"),
+        ),
+    )
+
+
+def _payload_text(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    return value if isinstance(value, str) else None
 
 
 def build_effect(

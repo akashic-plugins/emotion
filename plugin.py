@@ -44,6 +44,7 @@ _v3_emotion_root: Path | None = None
 _v3_emotion_module: "EmotionProjectionModule | None" = None
 
 _FEEDBACK_CONTEXT_SKILL = "feedback-preference-context"
+_FEEDBACK_PREVIEW_MAX_CHARS = 2400
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
 
 在这里写会影响未来主动推送取舍的稳定偏好。
@@ -278,6 +279,21 @@ def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
                     "pua_score": raw.get("pua_score"),
                     "lag_seconds": raw.get("lag_seconds"),
                     "matched_by": raw.get("matched_by", "typed_turn"),
+                    "candidate_count": raw.get("candidate_count"),
+                    "pa_score": raw.get("pa_score"),
+                    "reason": raw.get("reason", "typed_turn"),
+                    "user_content_preview": _feedback_preview(
+                        raw.get("user_content_preview")
+                        or event.persisted_user_message
+                        or event.input_message
+                    ),
+                    "assistant_content_preview": _feedback_preview(
+                        raw.get("assistant_content_preview") or event.assistant_response
+                    ),
+                    "proactive_content_preview": _feedback_preview(
+                        raw.get("proactive_content_preview")
+                        or _quoted_proactive_text(event.input_message)
+                    ),
                 }
                 return {
                     "source_event_id": f"proactive_feedback:{source}",
@@ -301,6 +317,16 @@ def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
         "pua_score": 1.0,
         "lag_seconds": None,
         "matched_by": "explicit_quote",
+        "candidate_count": None,
+        "pa_score": None,
+        "reason": "explicit_quote",
+        "user_content_preview": _feedback_preview(
+            event.persisted_user_message or event.input_message
+        ),
+        "assistant_content_preview": _feedback_preview(event.assistant_response),
+        "proactive_content_preview": _feedback_preview(
+            _quoted_proactive_text(event.input_message)
+        ),
     }
     return {
         "source_event_id": f"proactive_feedback:{source}",
@@ -308,6 +334,24 @@ def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
         "confidence": "gold",
         "payload": payload,
     }
+
+
+def _feedback_preview(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = " ".join(value.split())
+    if len(clean) <= _FEEDBACK_PREVIEW_MAX_CHARS:
+        return clean
+    return clean[:_FEEDBACK_PREVIEW_MAX_CHARS].rstrip() + "..."
+
+
+def _quoted_proactive_text(value: str) -> str | None:
+    marker = "【你当前新消息】"
+    quoted = value.split(marker, 1)[0].strip()
+    prefix = "被回复消息："
+    if quoted.startswith(prefix):
+        quoted = quoted[len(prefix) :].strip()
+    return quoted or None
 
 
 def _mobile_ui_query(

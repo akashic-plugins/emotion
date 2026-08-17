@@ -21,6 +21,12 @@ Akashic emotion and proactive tuning plugin.
 或旧 mobile/dashboard ABI。旧数据库不会在 import/apply 时自动迁移；切换前应先
 停用旧 runtime 并使用独立迁移脚本（尚未将旧源删除）。
 
+CI 的 Core pin 是 20062a715d2c5822228b327863b51c8d036119b3，因为旧 pin
+5624a059348406c1f97993612adfec886b158158 没有 domain_effect_lookup_export。
+该 commit 尚未发布到 Core 的公共默认分支前，CI checkout 失败属于明确的发布阻塞；
+本插件必须继续在 integration Core exact worktree 上验证，不得删除 lookup seam 或放宽
+candidate/formal oracle。
+
 ## 移动端看板
 
 插件通过通用移动 UI 生命周期注册“主动状态”入口，说明用户反馈如何改变 Agent 的语气

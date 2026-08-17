@@ -18,7 +18,14 @@ from bus.events_proactive import ProactiveFeedbackRecorded
 from bus.events_lifecycle import DriftFinished
 from proactive_v2.frame import ProactiveFrame
 
-from .db import apply_feedback, build_effect, get_state, open_db
+from .db import (
+    apply_feedback,
+    build_effect,
+    commit_domain_effect,
+    get_state,
+    lookup_domain_effect,
+    open_db,
+)
 from .dashboard import EmotionDashboardReader
 
 logger = logging.getLogger("plugin.emotion")

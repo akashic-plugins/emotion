@@ -34,6 +34,19 @@ class EmotionBehavior:
     expected_effect: str
 
 
+@dataclass(frozen=True)
+class EmotionDomainEffect:
+    """表示一次已由 Emotion SQLite 提交的幂等领域效果。"""
+
+    semantic_job_id: str
+    event_id: str
+    invocation_id: str
+    effect_id: str
+    idempotency_key: str
+    attempt: int
+    result_digest: str
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -86,6 +99,19 @@ def open_db(path: Path) -> sqlite3.Connection:
             prompt_section TEXT NOT NULL,
             metadata_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS emotion_domain_effects (
+            semantic_job_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            effect_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK (attempt >= 1),
+            result_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (invocation_id, effect_id, idempotency_key),
+            UNIQUE (semantic_job_id, event_id, effect_id)
+        );
         """
     )
     now = datetime.now(timezone.utc).isoformat()
@@ -98,6 +124,94 @@ def open_db(path: Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def commit_domain_effect(
+    conn: sqlite3.Connection,
+    *,
+    semantic_job_id: str,
+    event_id: str,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+    attempt: int,
+    result_digest: str,
+) -> EmotionDomainEffect:
+    """在 Emotion 事务内幂等提交一次 job 领域效果及其 durable receipt。"""
+
+    effect = EmotionDomainEffect(
+        semantic_job_id=_required_text(semantic_job_id, "semantic_job_id"),
+        event_id=_required_text(event_id, "event_id"),
+        invocation_id=_required_text(invocation_id, "invocation_id"),
+        effect_id=_required_text(effect_id, "effect_id"),
+        idempotency_key=_required_text(idempotency_key, "idempotency_key"),
+        attempt=_required_attempt(attempt),
+        result_digest=_required_text(result_digest, "result_digest"),
+    )
+
+    # 1. 锁定同一语义事件，避免新 invocation 重复提交领域效果。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM emotion_domain_effects
+            WHERE semantic_job_id = ? AND event_id = ? AND effect_id = ?
+            """,
+            (effect.semantic_job_id, effect.event_id, effect.effect_id),
+        ).fetchone()
+        if row is not None:
+            existing = _domain_effect_from_row(row)
+            if existing != effect:
+                raise RuntimeError("Emotion domain effect 幂等 identity 漂移")
+            conn.commit()
+            return existing
+
+        # 2. receipt 与该 effect 的领域写集在同一 SQLite transaction 提交。
+        conn.execute(
+            """
+            INSERT INTO emotion_domain_effects (
+                semantic_job_id, event_id, invocation_id, effect_id,
+                idempotency_key, attempt, result_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                effect.semantic_job_id,
+                effect.event_id,
+                effect.invocation_id,
+                effect.effect_id,
+                effect.idempotency_key,
+                effect.attempt,
+                effect.result_digest,
+            ),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return effect
+
+
+def lookup_domain_effect(
+    conn: sqlite3.Connection,
+    *,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+) -> EmotionDomainEffect | None:
+    """按 Core 固定的 invocation identity 读取 Emotion durable receipt。"""
+
+    row = conn.execute(
+        """
+        SELECT * FROM emotion_domain_effects
+        WHERE invocation_id = ? AND effect_id = ? AND idempotency_key = ?
+        """,
+        (
+            _required_text(invocation_id, "invocation_id"),
+            _required_text(effect_id, "effect_id"),
+            _required_text(idempotency_key, "idempotency_key"),
+        ),
+    ).fetchone()
+    return None if row is None else _domain_effect_from_row(row)
 
 
 def classify_feedback_delta(feedback_type: str, confidence: str) -> FeedbackDelta:
@@ -270,6 +384,34 @@ def get_state(conn: sqlite3.Connection) -> EmotionState:
         dominance=float(row["dominance"]),
         updated_at=str(row["updated_at"]),
     )
+
+
+def _domain_effect_from_row(row: sqlite3.Row) -> EmotionDomainEffect:
+    return EmotionDomainEffect(
+        semantic_job_id=str(row["semantic_job_id"]),
+        event_id=str(row["event_id"]),
+        invocation_id=str(row["invocation_id"]),
+        effect_id=str(row["effect_id"]),
+        idempotency_key=str(row["idempotency_key"]),
+        attempt=int(row["attempt"]),
+        result_digest=str(row["result_digest"]),
+    )
+
+
+def _required_text(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} 必须是字符串")
+    if not value or value.strip() != value:
+        raise ValueError(f"{field} 必须是无首尾空白的非空字符串")
+    return value
+
+
+def _required_attempt(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("attempt 必须是整数")
+    if value < 1:
+        raise ValueError("attempt 必须是正整数")
+    return value
 
 
 def _save_state(conn: sqlite3.Connection, state: EmotionState) -> None:

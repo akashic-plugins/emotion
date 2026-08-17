@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from datetime import datetime, timedelta, timezone
@@ -153,3 +154,60 @@ async def test_mobile_projection_rejects_invalid_limit(tmp_path: Path) -> None:
             session_id=None,
             turn_id=None,
         )
+
+
+def test_domain_effect_receipt_is_atomic_idempotent_and_durable(tmp_path: Path) -> None:
+    db_path = tmp_path / "emotion" / "emotion.db"
+    conn = module.open_db(db_path)
+    try:
+        digest = hashlib.sha256(b"merged-documents").hexdigest()
+        committed = module.commit_domain_effect(
+            conn,
+            semantic_job_id="emotion:merge_proactive_pending",
+            event_id="drift-1",
+            invocation_id="invocation-1",
+            effect_id="emotion.state",
+            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
+            attempt=1,
+            result_digest=digest,
+        )
+        repeated = module.commit_domain_effect(
+            conn,
+            semantic_job_id="emotion:merge_proactive_pending",
+            event_id="drift-1",
+            invocation_id="invocation-1",
+            effect_id="emotion.state",
+            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
+            attempt=1,
+            result_digest=digest,
+        )
+    finally:
+        conn.close()
+
+    restarted = module.open_db(db_path)
+    try:
+        found = module.lookup_domain_effect(
+            restarted,
+            invocation_id="invocation-1",
+            effect_id="emotion.state",
+            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
+        )
+        rows = restarted.execute(
+            "SELECT COUNT(*) FROM emotion_domain_effects"
+        ).fetchone()
+        with pytest.raises(RuntimeError, match="identity 漂移"):
+            module.commit_domain_effect(
+                restarted,
+                semantic_job_id="emotion:merge_proactive_pending",
+                event_id="drift-1",
+                invocation_id="invocation-2",
+                effect_id="emotion.state",
+                idempotency_key="emotion:merge_proactive_pending:event:drift-1",
+                attempt=1,
+                result_digest=digest,
+            )
+    finally:
+        restarted.close()
+
+    assert committed == repeated == found
+    assert rows is not None and int(rows[0]) == 1

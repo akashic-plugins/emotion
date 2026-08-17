@@ -171,7 +171,10 @@ def commit_domain_effect(
     )
 
     # 1. 锁定同一语义事件，避免新 invocation 重复提交领域效果。
-    conn.execute("BEGIN IMMEDIATE")
+    #    若调用方已经开启事务，receipt 必须加入该事务，不能提前提交。
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
             """
@@ -184,7 +187,8 @@ def commit_domain_effect(
             existing = _domain_effect_from_row(row)
             if existing != effect:
                 raise RuntimeError("Emotion domain effect 幂等 identity 漂移")
-            conn.commit()
+            if owns_transaction:
+                conn.commit()
             return existing
 
         # 2. receipt 与该 effect 的领域写集在同一 SQLite transaction 提交。
@@ -205,9 +209,11 @@ def commit_domain_effect(
                 effect.result_digest,
             ),
         )
-        conn.commit()
+        if owns_transaction:
+            conn.commit()
     except BaseException:
-        conn.rollback()
+        if owns_transaction:
+            conn.rollback()
         raise
     return effect
 
@@ -391,6 +397,7 @@ def build_effect(
     now_utc: datetime,
     last_user_at: datetime | None,
     base_threshold: float,
+    commit: bool = True,
 ) -> dict[str, Any]:
     stored = _decay(get_state(conn), now_utc.isoformat())
     energy = compute_energy(last_user_at, now_utc)
@@ -459,11 +466,40 @@ def build_effect(
             json.dumps(metadata, ensure_ascii=False),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return {
         "provider_name": "emotion",
         "prompt_section": prompt_section,
         "threshold_delta": threshold_delta,
+        "metadata": metadata,
+    }
+
+
+def lookup_effect(
+    conn: sqlite3.Connection,
+    *,
+    tick_id: str,
+) -> dict[str, Any] | None:
+    """Read one previously committed proactive projection without recomputing it."""
+
+    row = conn.execute(
+        """
+        SELECT prompt_section, threshold_delta, metadata_json
+        FROM emotion_effects
+        WHERE tick_id = ?
+        """,
+        (tick_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    metadata = json.loads(str(row["metadata_json"]))
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Emotion effect metadata 必须是 object")
+    return {
+        "provider_name": "emotion",
+        "prompt_section": str(row["prompt_section"]),
+        "threshold_delta": float(row["threshold_delta"]),
         "metadata": metadata,
     }
 

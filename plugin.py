@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, cast
@@ -26,6 +27,7 @@ from .db import (
     apply_feedback,
     build_effect,
     commit_domain_effect,
+    lookup_effect,
     lookup_domain_effect,
     lookup_domain_effect_path,
     open_db,
@@ -197,26 +199,56 @@ class EmotionProjectionModule:
         last_user_at = frame.slots.get("proactive:last_user_at")
         if last_user_at is not None and not hasattr(last_user_at, "tzinfo"):
             raise TypeError("emotion last_user_at 必须是 datetime 或 None")
+        tick_id = f"{frame.input.session_key}:{frame.input.started_at.isoformat()}"
         result: dict[str, Any] = {}
 
         # 2. Core signs the effect only after this SQLite transaction has a durable receipt.
         def transaction(effect_context: object) -> None:
-            del effect_context
+            exact_context = cast(Any, effect_context)
             conn = open_db(self._root / "emotion.db")
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                if (
+                    exact_context.event_id != tick_id
+                    or exact_context.tick_id != tick_id
+                ):
+                    raise RuntimeError("Emotion proactive tick identity 与 Core 不一致")
+                effect: dict[str, Any]
                 result["effect"] = build_effect(
                     conn,
-                    tick_id=f"frame:{frame.input.started_at.isoformat()}",
+                    tick_id=tick_id,
                     session_key=session_key,
                     now_utc=frame.input.started_at,
                     last_user_at=cast(Any, last_user_at),
                     base_threshold=base_threshold,
+                    commit=False,
                 )
+                effect = cast(dict[str, Any], result["effect"])
+                _ = commit_domain_effect(
+                    conn,
+                    semantic_job_id=exact_context.semantic_job_id,
+                    event_id=exact_context.event_id,
+                    invocation_id=exact_context.invocation_id,
+                    effect_id=exact_context.effect_id,
+                    idempotency_key=exact_context.idempotency_key,
+                    attempt=exact_context.attempt,
+                    result_digest=_effect_digest(effect),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
 
         await effects.run("emotion.state", transaction)
         effect = result.get("effect")
+        if not isinstance(effect, dict):
+            conn = open_db(self._root / "emotion.db")
+            try:
+                effect = lookup_effect(conn, tick_id=tick_id)
+            finally:
+                conn.close()
         if not isinstance(effect, dict):
             raise RuntimeError("emotion domain effect 未返回 frame projection")
         frame.slots["proactive:prompt:system_bottom:emotion"] = str(
@@ -224,6 +256,19 @@ class EmotionProjectionModule:
         )
         frame.slots["proactive:effect:emotion"] = effect
         return frame
+
+
+def _effect_digest(effect: Mapping[str, object]) -> str:
+    """Return the stable digest Core records for one committed projection."""
+
+    payload = json.dumps(
+        effect,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 async def run_emotion_prompt_v3(

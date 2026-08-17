@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
+
+from agent.plugin_composition import (
+    BACKGROUND_JOBS,
+    BackgroundJobDefinition,
+    Context,
+    CoreEvent,
+    CoreEventTrigger,
+)
 
 from agent.plugins import (
     EventTrigger,
@@ -24,11 +33,19 @@ from .db import (
     commit_domain_effect,
     get_state,
     lookup_domain_effect,
+    lookup_domain_effect_path,
     open_db,
 )
 from .dashboard import EmotionDashboardReader
 
 logger = logging.getLogger("plugin.emotion")
+
+api_version = 3
+name = "emotion"
+version = "1.1.0"
+inject = (BACKGROUND_JOBS,)
+workspace_roots = ("emotion",)
+_v3_emotion_root: Path | None = None
 
 _FEEDBACK_CONTEXT_SKILL = "feedback-preference-context"
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
@@ -81,6 +98,105 @@ _MERGE_PROACTIVE_CONTEXT_PROMPT = """\
 待合并推送偏好候选：
 {pending}
 """
+
+
+async def apply(ctx: Context, config: object) -> None:
+    """登记 Emotion 的 generation-bound proactive merge job。"""
+
+    # 1. 只冻结 Core 投影的 generation-local 数据根，不打开数据库或调用模型。
+    del config
+    global _v3_emotion_root
+    _v3_emotion_root = ctx.workspace_root("emotion")
+
+    # 2. JobHost 独占 event admission、LLM lease、effect receipt 与文档提交。
+    await ctx.require(BACKGROUND_JOBS).register(
+        ctx,
+        BackgroundJobDefinition(
+            name="merge_proactive_pending",
+            triggers=(CoreEventTrigger(CoreEvent.DRIFT_FINISHED),),
+            handler_export="merge_proactive_pending_v3",
+            documents_scope=("emotion",),
+            domain_effect="emotion.state",
+            domain_effect_lookup_export="lookup_emotion_domain_effect_v3",
+            model_role="agent",
+        ),
+    )
+
+
+async def merge_proactive_pending_v3(ctx: Any) -> None:
+    """形成 merge 内容，并经 Core receipt fence 发布两份 proactive 文档。"""
+
+    # 1. 非目标 Drift completion 不读取文档、不调用模型。
+    event = ctx.event
+    if not isinstance(event, DriftFinished):
+        return
+    if event.skill_name != _FEEDBACK_CONTEXT_SKILL or event.status != "completed":
+        return
+    if ctx.documents is None or ctx.domain_effects is None:
+        raise RuntimeError("emotion merge job 缺少 Core documents/domain effects")
+
+    # 2. 从窄 port 读取脱离 bytes，生成新文档并先持久化完整 intent。
+    expected, current = ctx.documents.read_pair()
+    pending = current.pending.decode("utf-8").strip()
+    if not pending or "- [ ]" not in pending:
+        return
+    current_context = current.context.decode("utf-8").strip()
+    if not current_context:
+        current_context = _PROACTIVE_CONTEXT_TEMPLATE.strip()
+    prompt = _MERGE_PROACTIVE_CONTEXT_PROMPT.format(
+        current_context=current_context,
+        pending=pending,
+    )
+    merged = await ctx.llm.generate_text(
+        system=_MERGE_PROACTIVE_CONTEXT_SYSTEM,
+        prompt=prompt,
+        max_tokens=4096,
+    )
+    if not merged:
+        return
+    pair = {
+        "context": merged.strip().encode("utf-8") + b"\n",
+        "pending": b"",
+    }
+    intent = await ctx.documents.prepare_pair(expected, pair)
+    result_digest = hashlib.sha256(pair["context"] + b"\0" + pair["pending"]).hexdigest()
+
+    # 3. Emotion SQLite 提交领域 receipt 后，Core 才能向前提交文档。
+    async def transaction(effect_ctx: Any) -> None:
+        db = open_db(_require_v3_emotion_root() / "emotion.db")
+        try:
+            _ = commit_domain_effect(
+                db,
+                semantic_job_id=effect_ctx.semantic_job_id,
+                event_id=effect_ctx.event_id or event.event_id,
+                invocation_id=effect_ctx.invocation_id,
+                effect_id=effect_ctx.effect_id,
+                idempotency_key=effect_ctx.idempotency_key,
+                attempt=effect_ctx.attempt,
+                result_digest=result_digest,
+            )
+        finally:
+            db.close()
+
+    receipt = await ctx.domain_effects.run("emotion.state", transaction)
+    _ = await ctx.documents.commit_after(intent, receipt)
+
+
+def lookup_emotion_domain_effect_v3(effect_ctx: Any) -> object | None:
+    """只读返回 Emotion durable receipt，供 Core 重签 exact capability。"""
+
+    return lookup_domain_effect_path(
+        _require_v3_emotion_root() / "emotion.db",
+        invocation_id=effect_ctx.invocation_id,
+        effect_id=effect_ctx.effect_id,
+        idempotency_key=effect_ctx.idempotency_key,
+    )
+
+
+def _require_v3_emotion_root() -> Path:
+    if _v3_emotion_root is None:
+        raise RuntimeError("emotion v3 generation 尚未绑定 workspace root")
+    return _v3_emotion_root
 
 
 class EmotionProactivePromptModule:

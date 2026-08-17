@@ -214,6 +214,30 @@ def lookup_domain_effect(
     return None if row is None else _domain_effect_from_row(row)
 
 
+def lookup_domain_effect_path(
+    path: Path,
+    *,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+) -> EmotionDomainEffect | None:
+    """只读查询既有 Emotion DB，不因恢复扫描创建任何文件。"""
+
+    if not path.is_file() or path.is_symlink():
+        return None
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return lookup_domain_effect(
+            conn,
+            invocation_id=invocation_id,
+            effect_id=effect_id,
+            idempotency_key=idempotency_key,
+        )
+    finally:
+        conn.close()
+
+
 def classify_feedback_delta(feedback_type: str, confidence: str) -> FeedbackDelta:
     if feedback_type == "explicit_quote":
         return FeedbackDelta(0.03, 0.08, "explicit_quote")

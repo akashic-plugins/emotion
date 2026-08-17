@@ -5,13 +5,25 @@ import importlib.util
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent.plugins.context import PluginContext, PluginKVStore
+from agent.plugin_composition import CompositionRoot, PluginRuntime
+from agent.plugin_composition.background_jobs import (
+    BACKGROUND_JOBS,
+    PluginBackgroundJobs,
+    _freeze_plugin_background_jobs,
+)
+from agent.plugins.proactive_documents import (
+    ProactiveDocumentDigests,
+    ProactiveDocumentPair,
+)
 from agent.plugins.scope import PluginScope, ScopedEventBus
 from bus.event_bus import EventBus
 from bus.events_proactive import ProactiveFeedbackRecorded
+from bus.events_lifecycle import DriftFinished
 
 
 def _load_plugin_module():
@@ -211,3 +223,115 @@ def test_domain_effect_receipt_is_atomic_idempotent_and_durable(tmp_path: Path) 
 
     assert committed == repeated == found
     assert rows is not None and int(rows[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_apply_registers_job_without_opening_emotion_db(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "emotion").mkdir(parents=True)
+    root = CompositionRoot("emotion-candidate")
+    jobs = PluginBackgroundJobs(root.instance_token)
+    _ = await root.context.provide(BACKGROUND_JOBS, jobs)
+
+    _ = await root.mount(
+        lambda ctx: module.apply(ctx, object()),
+        name="emotion",
+        inject=(BACKGROUND_JOBS,),
+        runtime=PluginRuntime(
+            plugin_id="emotion",
+            plugin_dir=Path(__file__).parents[1],
+            data_dir=tmp_path / "plugin-data",
+            workspace=workspace,
+            config=None,
+            workspace_roots=("emotion",),
+        ),
+    )
+    catalog = _freeze_plugin_background_jobs(jobs, root.instance_token)
+    binding = catalog.job("emotion:merge_proactive_pending")
+    assert binding is not None
+    assert binding.definition.documents_scope == ("emotion",)
+    assert binding.definition.domain_effect == "emotion.state"
+    assert not (workspace / "emotion" / "emotion.db").exists()
+    await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_v3_merge_uses_core_ports_and_durable_emotion_receipt(
+    tmp_path: Path,
+) -> None:
+    emotion_root = tmp_path / "workspace" / "emotion"
+    emotion_root.mkdir(parents=True)
+    setattr(module, "_v3_emotion_root", emotion_root)
+    calls: list[str] = []
+    prepared_intent = object()
+    issued_receipt = object()
+
+    class Documents:
+        def read_pair(self):
+            calls.append("read")
+            return (
+                ProactiveDocumentDigests(context=None, pending=None),
+                ProactiveDocumentPair(
+                    context=b"# Proactive Context\n",
+                    pending=b"- [ ] prefer calm summaries\n",
+                ),
+            )
+
+        async def prepare_pair(self, expected, pair):
+            calls.append("prepare")
+            assert expected.pending is None
+            assert pair["pending"] == b""
+            return prepared_intent
+
+        async def commit_after(self, intent, receipt):
+            calls.append("documents")
+            assert intent is prepared_intent
+            assert receipt is issued_receipt
+            return object()
+
+    class Effects:
+        async def run(self, effect_id, transaction):
+            calls.append("effect")
+            effect_ctx = SimpleNamespace(
+                semantic_job_id="emotion:merge_proactive_pending",
+                event_id="drift-v3-1",
+                invocation_id="invocation-v3-1",
+                effect_id=effect_id,
+                idempotency_key="emotion:merge_proactive_pending:event:drift-v3-1",
+                attempt=1,
+            )
+            await transaction(effect_ctx)
+            durable = module.lookup_emotion_domain_effect_v3(effect_ctx)
+            assert durable is not None
+            return issued_receipt
+
+    class Llm:
+        async def generate_text(self, **kwargs):
+            calls.append("llm")
+            assert "prefer calm summaries" in kwargs["prompt"]
+            return "# Proactive Context\n\n- Prefer calm summaries."
+
+    event = DriftFinished(
+        event_id="drift-v3-1",
+        session_key="session",
+        skill_name="feedback-preference-context",
+        status="completed",
+        briefing="briefing",
+        message_result="ok",
+        timestamp=datetime.now(timezone.utc),
+    )
+    ctx = SimpleNamespace(
+        event=event,
+        documents=Documents(),
+        domain_effects=Effects(),
+        llm=Llm(),
+    )
+
+    await module.merge_proactive_pending_v3(ctx)
+
+    assert calls == ["read", "llm", "prepare", "effect", "documents"]
+    db = module.open_db(emotion_root / "emotion.db")
+    try:
+        assert db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0] == 1
+    finally:
+        db.close()

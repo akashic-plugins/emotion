@@ -14,7 +14,7 @@ description: 从 proactive 正反馈中归纳待审核推送偏好候选，追�
 ## 流程
 
 ```text
-feedback events
+Emotion feedback samples
 ├─ evidence bundle
 │  ├─ proactive text
 │  ├─ user text
@@ -35,15 +35,15 @@ python3 skills/feedback-preference-context/scripts/sample_feedback_context.py sa
 
 ```text
 sample
-├─ 读取 drift.db 中 cursor.latest_processed_feedback_id
-├─ 查询 ../proactive_feedback/proactive_feedback.db
+├─ 读取 drift.db 中 cursor.latest_processed_emotion_sample_id
+├─ 查询 ../emotion/emotion.db 的 emotion_feedback_samples
 │  └─ feedback_type IN ('topic_follow', 'explicit_quote')
-├─ WHERE id > latest_processed_feedback_id
+├─ WHERE id > latest_processed_emotion_sample_id
 ├─ ORDER BY id DESC LIMIT 50
-├─ 用 ../sessions.db 回填 proactive/user 原文
-├─ proactive 文本截断到 100 字，user 文本不截断
+├─ 使用 typed Turn 已写入的 bounded proactive/user 文本
+├─ 不读取 sessions.db 或其他插件数据库
 ├─ 每次只返回 chunk-size 条 events
-└─ 返回 cursor_tail_feedback_id
+└─ 返回 cursor_tail_emotion_sample_id
 ```
 
 脚本不判断 topic、不判断 effect、不生成 pending 内容。
@@ -57,7 +57,7 @@ sample
 {
   "command": "python3 skills/feedback-preference-context/scripts/sample_feedback_context.py sample --drift-dir . --chunk-index 0 --chunk-size 10",
   "cwd": ".",
-  "description": "读取 proactive feedback 第 0 个 chunk",
+  "description": "读取 Emotion feedback sample 第 0 个 chunk",
   "timeout": 30
 }
 ```
@@ -78,7 +78,7 @@ sample
 14. 只有处理并写入所有 chunk，直到某个 chunk 返回 `has_more=false` 后，才能调用 `finish_drift`。
 15. 不要等 50 条全部看完再写，也不要为每条 event 单独写文件。
 16. 只追加新候选，不修改、不删除已有队列项；写文件时必须保留原文完整前缀，只在末尾增加新 batch/chunk 内容。
-17. 只看 proactive 消息和 user 回复这一对文本。assistant 后续回答不是证据来源。
+17. 只看 typed Turn sample 中的 proactive 消息和 user 回复文本。assistant 后续回答不是证据来源。
 18. MEMORY 只用于理解长期兴趣边界和查重；新增候选必须由当前 chunk 的 feedback 证据支撑。
 19. `signal_hints` 只是弱提示；最终 topic 粒度、用户态度、effect 都必须由你结合当前 chunk 和 MEMORY 推断。
 20. 不要求用户显式说喜欢或讨厌。追问、纠错、补充背景、切换关注对象、持续互动都可以作为态度证据，但必须解释它对推送决策有什么影响。
@@ -110,9 +110,9 @@ sample
     - `tone`：改变同一候选内容的表达方式。
 27. 不写普通生活事实、人设事实、一次性寒暄、测试消息。
 28. evidence 必须包含完整 `feedback#id` 和完整 user message id。
-29. 全部 chunk 都写入成功后，`cursor_update.latest_processed_feedback_id` 必须等于第 0 个 chunk 返回的 `cursor_tail_feedback_id`。
+29. 全部 chunk 都写入成功后，`cursor_update.latest_processed_emotion_sample_id` 必须等于第 0 个 chunk 返回的 `cursor_tail_emotion_sample_id`。
 30. `finish_drift.briefing` 必须使用实际处理结果，写清总样本数、chunk 数、pending 候选条数，不要估算。
-31. 如果只处理了部分 chunk，必须 `status="paused"`，不要推进 `latest_processed_feedback_id`。
+31. 如果只处理了部分 chunk，必须 `status="paused"`，不要推进 `latest_processed_emotion_sample_id`。
 
 ## proactive_pending.md 格式
 
@@ -163,9 +163,9 @@ sample
   "briefing": "根据 proactive 正反馈样本追加 proactive_pending.md 队列",
   "message_result": "silent",
   "cursor_update": {
-    "latest_processed_feedback_id": 123,
-    "active_cursor_tail_feedback_id": null,
-    "active_feedback_ids": null
+    "latest_processed_emotion_sample_id": 123,
+    "active_cursor_tail_emotion_sample_id": null,
+    "active_emotion_sample_ids": null
   },
   "journal_append": [
     {
@@ -173,7 +173,7 @@ sample
       "key": "1-123",
       "payload": {
         "feedback_ids": [1, 2, 3],
-        "cursor_tail_feedback_id": 123
+        "cursor_tail_emotion_sample_id": 123
       }
     }
   ]
@@ -184,8 +184,8 @@ sample
 
 - 一次最多处理 50 条反馈。
 - `explicit_quote` 必须包含，且视为更强证据，但不是自动规则。
-- 只有 `proactive_pending.md` 成功尾部追加后才能推进 `last_feedback_id`。
+- 只有 `proactive_pending.md` 成功尾部追加后才能推进 `latest_processed_emotion_sample_id`。
 - 写入前必须检查旧内容；禁止用新生成内容覆盖整个 pending 文件。
 - 不打扰用户，不调用 `message_push`。
 - 不读取或写入 `state.json`、`history.json`。
-- 不修改 proactive_feedback 数据库。
+- 只读 Emotion 数据库；不修改 `emotion.db` 或任何其他插件数据库。

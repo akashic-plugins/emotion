@@ -8,7 +8,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from proactive_v2.energy import compute_energy
+
+def compute_energy(
+    last_user_at: datetime | None,
+    now: datetime | None = None,
+    *,
+    alpha: float = 0.50,
+    beta: float = 0.35,
+    gamma: float = 0.15,
+    tau1_min: float = 30.0,
+    tau2_min: float = 240.0,
+    tau3_min: float = 2880.0,
+) -> float:
+    """Return the current interaction energy without depending on Core internals."""
+
+    if last_user_at is None:
+        return 0.0
+    now = now or datetime.now(timezone.utc)
+    minutes = max(0.0, (now - last_user_at).total_seconds() / 60.0)
+    return (
+        alpha * math.exp(-minutes / tau1_min)
+        + beta * math.exp(-minutes / tau2_min)
+        + gamma * math.exp(-minutes / tau3_min)
+    )
 
 
 @dataclass(frozen=True)
@@ -32,6 +54,19 @@ class EmotionBehavior:
     tone_instruction: str
     threshold_delta: float
     expected_effect: str
+
+
+@dataclass(frozen=True)
+class EmotionDomainEffect:
+    """表示一次已由 Emotion SQLite 提交的幂等领域效果。"""
+
+    semantic_job_id: str
+    event_id: str
+    invocation_id: str
+    effect_id: str
+    idempotency_key: str
+    attempt: int
+    result_digest: str
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -70,6 +105,27 @@ def open_db(path: Path) -> sqlite3.Connection:
             payload_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS emotion_feedback_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            source_event_id TEXT NOT NULL UNIQUE,
+            session_key TEXT NOT NULL,
+            user_message_id TEXT,
+            assistant_message_id TEXT,
+            proactive_message_id TEXT,
+            feedback_type TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            pa_score REAL,
+            pua_score REAL,
+            lag_seconds INTEGER,
+            candidate_count INTEGER,
+            matched_by TEXT,
+            reason TEXT,
+            user_content_preview TEXT,
+            assistant_content_preview TEXT,
+            proactive_content_preview TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS emotion_effects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -86,6 +142,19 @@ def open_db(path: Path) -> sqlite3.Connection:
             prompt_section TEXT NOT NULL,
             metadata_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS emotion_domain_effects (
+            semantic_job_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            effect_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK (attempt >= 1),
+            result_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (invocation_id, effect_id, idempotency_key),
+            UNIQUE (semantic_job_id, event_id, effect_id)
+        );
         """
     )
     now = datetime.now(timezone.utc).isoformat()
@@ -98,6 +167,124 @@ def open_db(path: Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def commit_domain_effect(
+    conn: sqlite3.Connection,
+    *,
+    semantic_job_id: str,
+    event_id: str,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+    attempt: int,
+    result_digest: str,
+) -> EmotionDomainEffect:
+    """在 Emotion 事务内幂等提交一次 job 领域效果及其 durable receipt。"""
+
+    effect = EmotionDomainEffect(
+        semantic_job_id=_required_text(semantic_job_id, "semantic_job_id"),
+        event_id=_required_text(event_id, "event_id"),
+        invocation_id=_required_text(invocation_id, "invocation_id"),
+        effect_id=_required_text(effect_id, "effect_id"),
+        idempotency_key=_required_text(idempotency_key, "idempotency_key"),
+        attempt=_required_attempt(attempt),
+        result_digest=_required_text(result_digest, "result_digest"),
+    )
+
+    # 1. 锁定同一语义事件，避免新 invocation 重复提交领域效果。
+    #    若调用方已经开启事务，receipt 必须加入该事务，不能提前提交。
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM emotion_domain_effects
+            WHERE semantic_job_id = ? AND event_id = ? AND effect_id = ?
+            """,
+            (effect.semantic_job_id, effect.event_id, effect.effect_id),
+        ).fetchone()
+        if row is not None:
+            existing = _domain_effect_from_row(row)
+            if existing != effect:
+                raise RuntimeError("Emotion domain effect 幂等 identity 漂移")
+            if owns_transaction:
+                conn.commit()
+            return existing
+
+        # 2. receipt 与该 effect 的领域写集在同一 SQLite transaction 提交。
+        conn.execute(
+            """
+            INSERT INTO emotion_domain_effects (
+                semantic_job_id, event_id, invocation_id, effect_id,
+                idempotency_key, attempt, result_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                effect.semantic_job_id,
+                effect.event_id,
+                effect.invocation_id,
+                effect.effect_id,
+                effect.idempotency_key,
+                effect.attempt,
+                effect.result_digest,
+            ),
+        )
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        raise
+    return effect
+
+
+def lookup_domain_effect(
+    conn: sqlite3.Connection,
+    *,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+) -> EmotionDomainEffect | None:
+    """按 Core 固定的 invocation identity 读取 Emotion durable receipt。"""
+
+    row = conn.execute(
+        """
+        SELECT * FROM emotion_domain_effects
+        WHERE invocation_id = ? AND effect_id = ? AND idempotency_key = ?
+        """,
+        (
+            _required_text(invocation_id, "invocation_id"),
+            _required_text(effect_id, "effect_id"),
+            _required_text(idempotency_key, "idempotency_key"),
+        ),
+    ).fetchone()
+    return None if row is None else _domain_effect_from_row(row)
+
+
+def lookup_domain_effect_path(
+    path: Path,
+    *,
+    invocation_id: str,
+    effect_id: str,
+    idempotency_key: str,
+) -> EmotionDomainEffect | None:
+    """只读查询既有 Emotion DB，不因恢复扫描创建任何文件。"""
+
+    if not path.is_file() or path.is_symlink():
+        return None
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return lookup_domain_effect(
+            conn,
+            invocation_id=invocation_id,
+            effect_id=effect_id,
+            idempotency_key=idempotency_key,
+        )
+    finally:
+        conn.close()
 
 
 def classify_feedback_delta(feedback_type: str, confidence: str) -> FeedbackDelta:
@@ -163,9 +350,65 @@ def apply_feedback(
         )
     except sqlite3.IntegrityError:
         return before
+    if feedback_type in {"topic_follow", "explicit_quote"}:
+        _insert_feedback_sample(
+            conn,
+            source_event_id=source_event_id,
+            session_key=session_key,
+            feedback_type=feedback_type,
+            confidence=confidence,
+            payload=payload,
+        )
     _save_state(conn, after)
     conn.commit()
     return after
+
+
+def _insert_feedback_sample(
+    conn: sqlite3.Connection,
+    *,
+    source_event_id: str,
+    session_key: str,
+    feedback_type: str,
+    confidence: str,
+    payload: dict[str, Any],
+) -> None:
+    """Persist the bounded typed-Turn sample consumed by the Emotion Drift skill."""
+
+    _ = conn.execute(
+        """
+        INSERT INTO emotion_feedback_samples (
+            source_event_id, session_key, user_message_id,
+            assistant_message_id, proactive_message_id, feedback_type,
+            confidence, pa_score, pua_score, lag_seconds, candidate_count,
+            matched_by, reason, user_content_preview,
+            assistant_content_preview, proactive_content_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_event_id,
+            session_key,
+            _payload_text(payload, "user_message_id"),
+            _payload_text(payload, "assistant_message_id"),
+            _payload_text(payload, "proactive_message_id"),
+            feedback_type,
+            confidence,
+            payload.get("pa_score"),
+            payload.get("pua_score"),
+            payload.get("lag_seconds"),
+            payload.get("candidate_count"),
+            _payload_text(payload, "matched_by"),
+            _payload_text(payload, "reason"),
+            _payload_text(payload, "user_content_preview"),
+            _payload_text(payload, "assistant_content_preview"),
+            _payload_text(payload, "proactive_content_preview"),
+        ),
+    )
+
+
+def _payload_text(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    return value if isinstance(value, str) else None
 
 
 def build_effect(
@@ -176,6 +419,7 @@ def build_effect(
     now_utc: datetime,
     last_user_at: datetime | None,
     base_threshold: float,
+    commit: bool = True,
 ) -> dict[str, Any]:
     stored = _decay(get_state(conn), now_utc.isoformat())
     energy = compute_energy(last_user_at, now_utc)
@@ -244,11 +488,40 @@ def build_effect(
             json.dumps(metadata, ensure_ascii=False),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return {
         "provider_name": "emotion",
         "prompt_section": prompt_section,
         "threshold_delta": threshold_delta,
+        "metadata": metadata,
+    }
+
+
+def lookup_effect(
+    conn: sqlite3.Connection,
+    *,
+    tick_id: str,
+) -> dict[str, Any] | None:
+    """Read one previously committed proactive projection without recomputing it."""
+
+    row = conn.execute(
+        """
+        SELECT prompt_section, threshold_delta, metadata_json
+        FROM emotion_effects
+        WHERE tick_id = ?
+        """,
+        (tick_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    metadata = json.loads(str(row["metadata_json"]))
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Emotion effect metadata 必须是 object")
+    return {
+        "provider_name": "emotion",
+        "prompt_section": str(row["prompt_section"]),
+        "threshold_delta": float(row["threshold_delta"]),
         "metadata": metadata,
     }
 
@@ -270,6 +543,34 @@ def get_state(conn: sqlite3.Connection) -> EmotionState:
         dominance=float(row["dominance"]),
         updated_at=str(row["updated_at"]),
     )
+
+
+def _domain_effect_from_row(row: sqlite3.Row) -> EmotionDomainEffect:
+    return EmotionDomainEffect(
+        semantic_job_id=str(row["semantic_job_id"]),
+        event_id=str(row["event_id"]),
+        invocation_id=str(row["invocation_id"]),
+        effect_id=str(row["effect_id"]),
+        idempotency_key=str(row["idempotency_key"]),
+        attempt=int(row["attempt"]),
+        result_digest=str(row["result_digest"]),
+    )
+
+
+def _required_text(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} 必须是字符串")
+    if not value or value.strip() != value:
+        raise ValueError(f"{field} 必须是无首尾空白的非空字符串")
+    return value
+
+
+def _required_attempt(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("attempt 必须是整数")
+    if value < 1:
+        raise ValueError("attempt 必须是正整数")
+    return value
 
 
 def _save_state(conn: sqlite3.Connection, state: EmotionState) -> None:

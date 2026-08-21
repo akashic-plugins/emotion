@@ -12,7 +12,7 @@ QUESTION_MARKERS = ("吗", "么", "为什么", "怎么", "谁", "哪")
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -37,24 +37,6 @@ def _load_cursor(drift_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return cast(dict[str, Any], data) if isinstance(data, dict) else {}
-
-
-def _message_previews(workspace: Path, ids: list[str]) -> dict[str, str]:
-    db_path = workspace / "sessions.db"
-    if not ids or not db_path.exists():
-        return {}
-    unique_ids = list(dict.fromkeys(text for text in ids if text))
-    placeholders = ",".join("?" for _ in unique_ids)
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, content
-            FROM messages
-            WHERE id IN ({placeholders})
-            """,
-            unique_ids,
-        ).fetchall()
-    return {str(row["id"]): str(row["content"] or "") for row in rows}
 
 
 def _clip_text(text: str, limit: int) -> str:
@@ -86,56 +68,62 @@ def sample(
     chunk_size: int,
     chunk_index: int,
 ) -> dict[str, Any]:
+    """Read bounded feedback samples from the Emotion-owned derived database."""
+
     workspace = drift_dir.parent
-    feedback_db = workspace / "proactive_feedback" / "proactive_feedback.db"
-    if not feedback_db.exists():
-        return {"found": False, "reason": "feedback_db_missing"}
+    emotion_db = workspace / "emotion" / "emotion.db"
+    if not emotion_db.is_file() or emotion_db.is_symlink():
+        return _empty_result(0, "emotion_db_missing", chunk_index, chunk_size)
 
     cursor = _load_cursor(drift_dir)
-    last_feedback_id = int(
-        cursor.get("latest_processed_feedback_id")
-        or cursor.get("last_feedback_id")
-        or 0
-    )
+    last_sample_id = int(cursor.get("latest_processed_emotion_sample_id") or 0)
     safe_limit = max(1, min(int(limit), 50))
-    with _connect(feedback_db) as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                id,
-                created_at,
-                session_key,
-                user_message_id,
-                proactive_message_id,
-                feedback_type,
-                confidence,
-                pa_score,
-                pua_score,
-                lag_seconds,
-                candidate_count,
-                matched_by,
-                reason
-            FROM proactive_feedback_events
-            WHERE id > ?
-              AND feedback_type IN ('topic_follow', 'explicit_quote')
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (last_feedback_id, safe_limit),
-        ).fetchall()
+    try:
+        with _connect(emotion_db) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    created_at,
+                    session_key,
+                    user_message_id,
+                    proactive_message_id,
+                    feedback_type,
+                    confidence,
+                    pa_score,
+                    pua_score,
+                    lag_seconds,
+                    candidate_count,
+                    matched_by,
+                    reason,
+                    user_content_preview,
+                    assistant_content_preview,
+                    proactive_content_preview
+                FROM emotion_feedback_samples
+                WHERE id > ?
+                  AND feedback_type IN ('topic_follow', 'explicit_quote')
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (last_sample_id, safe_limit),
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table: emotion_feedback_samples" not in str(exc):
+            raise
+        return _empty_result(
+            last_sample_id,
+            "emotion_feedback_samples_missing",
+            chunk_index,
+            chunk_size,
+        )
 
     if not rows:
-        return {
-            "found": False,
-            "last_feedback_id": last_feedback_id,
-            "latest_processed_feedback_id": last_feedback_id,
-            "cursor_tail_feedback_id": last_feedback_id,
-            "count": 0,
-            "chunk_index": max(0, int(chunk_index)),
-            "chunk_size": max(1, min(int(chunk_size), 10)),
-            "has_more": False,
-            "next_chunk_index": None,
-        }
+        return _empty_result(
+            last_sample_id,
+            "emotion_feedback_samples_empty",
+            chunk_index,
+            chunk_size,
+        )
 
     safe_chunk_size = max(1, min(int(chunk_size), 10))
     safe_chunk_index = max(0, int(chunk_index))
@@ -144,22 +132,11 @@ def sample(
     chunk_rows = rows[chunk_start:chunk_end]
     has_more = chunk_end < len(rows)
 
-    message_ids: list[str] = []
-    for row in chunk_rows:
-        message_ids.extend(
-            str(row[key] or "")
-            for key in (
-                "proactive_message_id",
-                "user_message_id",
-            )
-            if row[key]
-        )
-    previews = _message_previews(workspace, message_ids)
     events: list[dict[str, Any]] = []
     for row in chunk_rows:
         proactive_id = str(row["proactive_message_id"] or "")
         user_id = str(row["user_message_id"] or "")
-        user_text = _clean_text(previews.get(user_id, ""))
+        user_text = _clean_text(str(row["user_content_preview"] or ""))
         events.append(
             {
                 "id": int(row["id"]),
@@ -183,7 +160,7 @@ def sample(
                 ),
                 "texts": {
                     "proactive": _clip_text(
-                        previews.get(proactive_id, ""),
+                        str(row["proactive_content_preview"] or ""),
                         PROACTIVE_TEXT_LIMIT,
                     ),
                     "user": user_text,
@@ -194,10 +171,10 @@ def sample(
     cursor_tail = max(int(row["id"]) for row in rows)
     return {
         "found": True,
-        "last_feedback_id": last_feedback_id,
-        "latest_processed_feedback_id": last_feedback_id,
+        "last_sample_id": last_sample_id,
+        "latest_processed_emotion_sample_id": last_sample_id,
         "count": len(rows),
-        "cursor_tail_feedback_id": cursor_tail,
+        "cursor_tail_emotion_sample_id": cursor_tail,
         "feedback_ids": [int(row["id"]) for row in rows],
         "chunk_index": safe_chunk_index,
         "chunk_size": safe_chunk_size,
@@ -210,6 +187,26 @@ def sample(
             "user": None,
         },
         "events": events,
+    }
+
+
+def _empty_result(
+    last_sample_id: int,
+    reason: str,
+    chunk_index: int,
+    chunk_size: int,
+) -> dict[str, Any]:
+    return {
+        "found": False,
+        "reason": reason,
+        "last_sample_id": last_sample_id,
+        "latest_processed_emotion_sample_id": last_sample_id,
+        "cursor_tail_emotion_sample_id": last_sample_id,
+        "count": 0,
+        "chunk_index": max(0, int(chunk_index)),
+        "chunk_size": max(1, min(int(chunk_size), 10)),
+        "has_more": False,
+        "next_chunk_index": None,
     }
 
 
@@ -250,9 +247,9 @@ def evidence_bundle(
 
     return {
         "found": True,
-        "last_feedback_id": first["last_feedback_id"],
+        "last_sample_id": first["last_sample_id"],
         "count": first["count"],
-        "cursor_tail_feedback_id": first["cursor_tail_feedback_id"],
+        "cursor_tail_emotion_sample_id": first["cursor_tail_emotion_sample_id"],
         "feedback_ids": first["feedback_ids"],
         "events": compact_events,
     }

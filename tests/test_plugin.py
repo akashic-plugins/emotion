@@ -87,7 +87,9 @@ def _copy_emotion_plugin(tmp_path: Path) -> Path:
     shutil.copytree(
         source,
         target,
-        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+        ignore=shutil.ignore_patterns(
+            ".git", ".akashic-core", "__pycache__", ".pytest_cache"
+        ),
     )
     return target
 

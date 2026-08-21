@@ -39,7 +39,7 @@ jobs:
           # 5624 lacks the v3 domain-effect lookup export. Keep this exact
           # Core commit until it is published; checkout failure is intentional
           # release blocking, not permission to weaken the plugin oracle.
-          ref: 20062a715d2c5822228b327863b51c8d036119b3
+          ref: 3005f838bcd96e2cbc58616aede46e4f39df4523
           path: .akashic-core
       - uses: actions/setup-python@v5
         with:

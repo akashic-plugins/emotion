@@ -57,7 +57,11 @@ Emotion 接纳、改变了什么、是否进入 Drift evidence”的独立应用
 可选 sample、VAD current 和 `pf_history_cursor` 同事务提交。普通非引用反馈在 PF accepted
 前不会进入 Emotion，下一 Timer 后恰好应用一次。显式引用由 Emotion direct rule 立即
 应用；PF 后续同 user message receipt 仍追加零 delta terminal 并推进 cursor/hash，但不再
-增加 VAD 或重复写 Drift sample。
+增加 VAD 或重复写 Drift sample。跨插件边界会按 PF v1 完整稳定字段（包括 `session_key`）
+重算 canonical JSON SHA-256；字段、类型、有限数值或 hash 漂移都会在 cursor 前 fail-loud。
+旧 Emotion 已应用但没有 hash 的 `proactive_feedback:<id>` 事实保持原样；identity 相符时另
+追加 `pf_history_import:<cursor>` 零 delta/零 sample terminal receipt，再同事务推进 cursor，
+identity 冲突则整页回滚。
 
 ## 旧 proactive island 交接
 

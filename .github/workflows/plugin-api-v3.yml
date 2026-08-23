@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: akashic-plugins/proactive_feedback
-          ref: 7784740d35856bdfa3d0cccd7ab93f8826130a86
+          ref: 531eae4e4ac4714aad5417b8257a724007728345
           path: .proactive-feedback
       - uses: actions/setup-python@v5
         with:

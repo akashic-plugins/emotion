@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -58,6 +59,10 @@ class EmotionBehavior:
 
 
 _SCHEMA_VERSION = 2
+_PF_FEEDBACK_TYPES = frozenset(
+    {"explicit_quote", "topic_follow", "no_topic_follow", "unscored"}
+)
+_PF_CONFIDENCE = frozenset({"gold", "high", "medium", "low"})
 _TABLE_SQL = {
     "emotion_state": """
         CREATE TABLE emotion_state (
@@ -767,42 +772,84 @@ def apply_feedback_history_page(
         raise RuntimeError("Emotion PF history cursor 缺失")
     current = int(state["row_id"])
     previous = current
+    validated: list[tuple[int, str, str, dict[str, Any]]] = []
     for record in records:
         cursor = _history_cursor(record)
-        if _history_text(record, "event_id") != f"proactive_feedback:{cursor}":
+        event_id = _history_text(record, "event_id")
+        if event_id != f"proactive_feedback:{cursor}":
             raise ValueError("PF history event_id 与 cursor 不一致")
         if cursor <= previous:
             raise ValueError("PF history page cursor 必须严格递增且晚于本地 cursor")
+        payload_hash = _history_hash(record)
+        payload = _canonical_history_payload(record)
+        if _canonical_history_hash(payload) != payload_hash:
+            raise RuntimeError(f"PF history payload hash 漂移: {event_id}")
+        validated.append((cursor, event_id, payload_hash, payload))
         previous = cursor
 
     # 2. Apply every accepted fact and its derived sample inside one transaction.
     try:
         conn.execute("BEGIN IMMEDIATE")
-        for record in records:
-            event_id = _history_text(record, "event_id")
-            payload_hash = _history_hash(record)
-            payload = _history_payload(record, payload_hash)
-            existing = conn.execute(
+        for cursor, event_id, payload_hash, canonical in validated:
+            payload = _history_payload(canonical, cursor, payload_hash)
+            receipt_id = f"pf_history_import:{cursor}"
+            receipt = conn.execute(
                 "SELECT payload_json FROM emotion_events WHERE source_event_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if receipt is not None:
+                _verify_import_receipt(receipt, event_id, payload_hash)
+                current = cursor
+                continue
+            existing = conn.execute(
+                """
+                SELECT source_plugin, source_type, session_key, payload_json
+                FROM emotion_events
+                WHERE source_event_id=?
+                """,
                 (event_id,),
             ).fetchone()
             if existing is not None:
                 stored = json.loads(str(existing["payload_json"]))
-                if not isinstance(stored, dict) or stored.get(
-                    "source_payload_hash"
-                ) != payload_hash:
-                    raise RuntimeError(f"PF history payload hash 漂移: {event_id}")
+                if not isinstance(stored, dict):
+                    raise RuntimeError(f"PF history legacy payload 无效: {event_id}")
+                stored_hash = stored.get("source_payload_hash")
+                if stored_hash is None:
+                    _validate_legacy_history_event(
+                        existing, stored, canonical, event_id
+                    )
+                    receipt_payload = {
+                        **payload,
+                        "disposition": "legacy_event_already_applied",
+                        "legacy_event_id": event_id,
+                    }
+                    _record_feedback_terminal(
+                        conn,
+                        source_plugin="emotion",
+                        source_event_id=receipt_id,
+                        source_type="pf_history_import_terminal",
+                        session_key=str(canonical["session_key"]),
+                        reason="legacy_event_already_applied",
+                        payload=receipt_payload,
+                    )
+                else:
+                    _verify_stored_history_event(
+                        existing, stored, canonical, payload_hash, event_id
+                    )
             elif (
-                _history_text(record, "feedback_type") == "explicit_quote"
+                canonical["feedback_type"] == "explicit_quote"
                 and _direct_quote_already_applied(
                     conn,
-                    _history_text(record, "user_message_id"),
+                    str(canonical["user_message_id"]),
                 )
             ):
                 _record_feedback_terminal(
                     conn,
+                    source_plugin="proactive_feedback",
                     source_event_id=event_id,
-                    session_key=_history_text(record, "session_key"),
+                    source_type="explicit_quote_already_applied",
+                    session_key=str(canonical["session_key"]),
+                    reason="direct_quote_already_applied",
                     payload=payload,
                 )
             else:
@@ -810,12 +857,12 @@ def apply_feedback_history_page(
                     conn,
                     source_plugin="proactive_feedback",
                     source_event_id=event_id,
-                    session_key=_history_text(record, "session_key"),
-                    feedback_type=_history_text(record, "feedback_type"),
-                    confidence=_history_text(record, "confidence"),
+                    session_key=str(canonical["session_key"]),
+                    feedback_type=str(canonical["feedback_type"]),
+                    confidence=str(canonical["confidence"]),
                     payload=payload,
                 )
-            current = _history_cursor(record)
+            current = cursor
         if records:
             _ = conn.execute(
                 """
@@ -863,11 +910,14 @@ def _direct_quote_already_applied(
 def _record_feedback_terminal(
     conn: sqlite3.Connection,
     *,
+    source_plugin: str,
     source_event_id: str,
+    source_type: str,
     session_key: str,
+    reason: str,
     payload: dict[str, Any],
 ) -> None:
-    """Record a PF receipt whose direct quote effect was already applied."""
+    """Record an applied-without-new-effect terminal in Emotion history."""
 
     state = get_state(conn)
     _ = conn.execute(
@@ -881,9 +931,9 @@ def _record_feedback_terminal(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?, ?, ?, ?)
         """,
         (
-            "proactive_feedback",
+            source_plugin,
             source_event_id,
-            "explicit_quote_already_applied",
+            source_type,
             session_key,
             state.valence,
             state.arousal,
@@ -891,7 +941,7 @@ def _record_feedback_terminal(
             state.valence,
             state.arousal,
             state.dominance,
-            "direct_quote_already_applied",
+            reason,
             json.dumps(payload, ensure_ascii=False),
         ),
     )
@@ -988,30 +1038,164 @@ def _history_hash(record: dict[str, Any]) -> str:
     return value
 
 
-def _history_payload(
+def _canonical_history_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate and freeze exactly the fields owned by PF history v1."""
+
+    return {
+        "session_key": _history_text(record, "session_key"),
+        "user_message_id": _history_text(record, "user_message_id"),
+        "assistant_message_id": _history_text(record, "assistant_message_id"),
+        "proactive_message_id": _history_optional_text(
+            record, "proactive_message_id"
+        ),
+        "feedback_type": _history_enum(
+            record, "feedback_type", _PF_FEEDBACK_TYPES
+        ),
+        "confidence": _history_enum(
+            record, "confidence", _PF_CONFIDENCE
+        ),
+        "pa_score": _history_optional_score(record, "pa_score"),
+        "pua_score": _history_optional_score(record, "pua_score"),
+        "lag_seconds": _history_optional_nonnegative_int(record, "lag_seconds"),
+        "candidate_count": _history_nonnegative_int(record, "candidate_count"),
+        "matched_by": _history_text(record, "matched_by"),
+        "reason": _history_text(record, "reason"),
+        "user_content_preview": _history_optional_text(
+            record, "user_content_preview"
+        ),
+        "assistant_content_preview": _history_optional_text(
+            record, "assistant_content_preview"
+        ),
+        "proactive_content_preview": _history_optional_text(
+            record, "proactive_content_preview"
+        ),
+    }
+
+
+def _canonical_history_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _history_optional_text(record: dict[str, Any], field: str) -> str | None:
+    value = record.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"PF history {field} 必须是字符串或 null")
+    return value
+
+
+def _history_enum(
     record: dict[str, Any],
+    field: str,
+    allowed: frozenset[str],
+) -> str:
+    value = _history_text(record, field)
+    if value not in allowed:
+        raise ValueError(f"PF history {field} 不支持: {value}")
+    return value
+
+
+def _history_nonnegative_int(record: dict[str, Any], field: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"PF history {field} 必须是非负整数")
+    return value
+
+
+def _history_optional_nonnegative_int(
+    record: dict[str, Any], field: str
+) -> int | None:
+    value = record.get(field)
+    if value is None:
+        return None
+    return _history_nonnegative_int(record, field)
+
+
+def _history_optional_score(record: dict[str, Any], field: str) -> float | None:
+    value = record.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"PF history {field} 必须是数字或 null")
+    score = float(value)
+    if not math.isfinite(score) or score < -1.0 or score > 1.0:
+        raise ValueError(f"PF history {field} 必须在 -1..1 之间")
+    return score
+
+
+def _verify_import_receipt(
+    receipt: sqlite3.Row,
+    event_id: str,
+    payload_hash: str,
+) -> None:
+    payload = json.loads(str(receipt["payload_json"]))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("disposition") != "legacy_event_already_applied"
+        or payload.get("legacy_event_id") != event_id
+        or payload.get("source_payload_hash") != payload_hash
+    ):
+        raise RuntimeError(f"PF history import receipt 漂移: {event_id}")
+
+
+def _validate_legacy_history_event(
+    event: sqlite3.Row,
+    stored: dict[str, Any],
+    canonical: dict[str, Any],
+    event_id: str,
+) -> None:
+    """Match a v1 applied event by its preserved identity without inventing a hash."""
+
+    if (
+        event["source_plugin"] != "proactive_feedback"
+        or event["source_type"] != canonical["feedback_type"]
+        or event["session_key"] != canonical["session_key"]
+    ):
+        raise RuntimeError(f"PF history legacy identity 冲突: {event_id}")
+    for field in (
+        "user_message_id",
+        "assistant_message_id",
+        "proactive_message_id",
+        "feedback_type",
+    ):
+        if field not in stored or stored[field] != canonical[field]:
+            raise RuntimeError(f"PF history legacy identity 冲突: {event_id}")
+
+
+def _verify_stored_history_event(
+    event: sqlite3.Row,
+    stored: dict[str, Any],
+    canonical: dict[str, Any],
+    payload_hash: str,
+    event_id: str,
+) -> None:
+    if (
+        stored.get("source_payload_hash") != payload_hash
+        or event["session_key"] != canonical["session_key"]
+    ):
+        raise RuntimeError(f"PF history payload hash 漂移: {event_id}")
+    for field, value in canonical.items():
+        if field == "session_key":
+            continue
+        if field not in stored or stored[field] != value:
+            raise RuntimeError(f"PF history payload hash 漂移: {event_id}")
+
+
+def _history_payload(
+    canonical: dict[str, Any],
+    cursor: int,
     payload_hash: str,
 ) -> dict[str, Any]:
-    payload = {
-        field: record.get(field)
-        for field in (
-            "user_message_id",
-            "assistant_message_id",
-            "proactive_message_id",
-            "feedback_type",
-            "confidence",
-            "pa_score",
-            "pua_score",
-            "lag_seconds",
-            "candidate_count",
-            "matched_by",
-            "reason",
-            "user_content_preview",
-            "assistant_content_preview",
-            "proactive_content_preview",
-        )
-    }
-    payload["source_cursor"] = _history_cursor(record)
+    payload = dict(canonical)
+    payload["source_cursor"] = cursor
     payload["source_payload_hash"] = payload_hash
     return payload
 

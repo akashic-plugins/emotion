@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import inspect
+import json
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -304,6 +306,42 @@ def _create_formal_legacy_fixture(path: Path) -> None:
         )
     conn.commit()
     conn.close()
+
+
+def _insert_legacy_pf_event(path: Path, *, user_message_id: str = "u1") -> None:
+    payload = {
+        "feedback_event_id": "1",
+        "user_message_id": user_message_id,
+        "assistant_message_id": "a1",
+        "proactive_message_id": "p1",
+        "feedback_type": "topic_follow",
+        "confidence": "high",
+        "pa_score": 0.8,
+        "pua_score": 0.7,
+        "lag_seconds": 1,
+        "candidate_count": 1,
+        "matched_by": "pua",
+        "reason": "fixture",
+        "user_content_preview": "继续",
+        "assistant_content_preview": "回答",
+        "proactive_content_preview": "提醒",
+    }
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO emotion_events(
+                source_plugin, source_event_id, source_type, session_key,
+                valence_before, arousal_before, dominance_before,
+                valence_delta, arousal_delta, dominance_delta,
+                valence_after, arousal_after, dominance_after, reason, payload_json
+            ) VALUES(
+                'proactive_feedback', 'proactive_feedback:1', 'topic_follow',
+                'mobile:test', 0.18, -0.1, 0.25, 0.02, 0, 0.05,
+                0.2, -0.1, 0.3, 'topic_follow_high', ?
+            )
+            """,
+            (json.dumps(payload, ensure_ascii=False),),
+        )
 
 
 def test_formal_legacy_upgrade_is_atomic_and_preserves_all_rows(tmp_path: Path) -> None:
@@ -613,10 +651,10 @@ def _count_rows(path: Path, table: str) -> int:
 
 
 def _history_record(cursor: int, **changes: object) -> SimpleNamespace:
+    supplied_hash = changes.pop("payload_hash", None)
     values: dict[str, object] = {
         "cursor": cursor,
         "event_id": f"proactive_feedback:{cursor}",
-        "payload_hash": f"{cursor:064x}",
         "session_key": "mobile:test",
         "user_message_id": f"u{cursor}",
         "assistant_message_id": f"a{cursor}",
@@ -634,6 +672,35 @@ def _history_record(cursor: int, **changes: object) -> SimpleNamespace:
         "proactive_content_preview": "提醒",
     }
     values.update(changes)
+    canonical = {
+        field: values[field]
+        for field in (
+            "session_key",
+            "user_message_id",
+            "assistant_message_id",
+            "proactive_message_id",
+            "feedback_type",
+            "confidence",
+            "pa_score",
+            "pua_score",
+            "lag_seconds",
+            "candidate_count",
+            "matched_by",
+            "reason",
+            "user_content_preview",
+            "assistant_content_preview",
+            "proactive_content_preview",
+        )
+    }
+    values["payload_hash"] = supplied_hash or hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     return SimpleNamespace(**values)
 
 
@@ -760,6 +827,214 @@ def test_feedback_history_page_is_atomic_idempotent_and_detects_hash_drift(
     ).fetchone() == (0,)
     assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (2,)
     connection.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "mutated"),
+    (
+        ("session_key", "mobile:other"),
+        ("user_message_id", "other-user"),
+        ("assistant_message_id", "other-assistant"),
+        ("proactive_message_id", None),
+        ("feedback_type", "no_topic_follow"),
+        ("confidence", "low"),
+        ("pa_score", 0.1),
+        ("pua_score", 0.2),
+        ("lag_seconds", 99),
+        ("candidate_count", 2),
+        ("matched_by", "other-rule"),
+        ("reason", "changed"),
+        ("user_content_preview", None),
+        ("assistant_content_preview", None),
+        ("proactive_content_preview", None),
+    ),
+)
+def test_feedback_history_recomputes_canonical_hash_before_apply(
+    tmp_path: Path,
+    field: str,
+    mutated: object,
+) -> None:
+    original = _history_record(1)
+    record = _history_record(
+        1,
+        **{field: mutated, "payload_hash": original.payload_hash},
+    )
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, RecordingHistory([record])),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="payload hash 漂移"):
+        consumer.tick_once()
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (0,)
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (0,)
+    connection.close()
+
+
+@pytest.mark.parametrize("score", (float("nan"), float("inf"), float("-inf")))
+def test_feedback_history_rejects_nonfinite_scores(
+    tmp_path: Path,
+    score: float,
+) -> None:
+    record = _history_record(1, pa_score=score, payload_hash="0" * 64)
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, RecordingHistory([record])),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="pa_score 必须在"):
+        consumer.tick_once()
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (0,)
+    connection.close()
+
+
+def test_legacy_pf_event_import_records_terminal_without_double_apply(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "emotion.db"
+    _create_formal_legacy_fixture(path)
+    _insert_legacy_pf_event(path)
+    upgraded = module.open_db(path)
+    before_state = tuple(upgraded.execute(
+        "SELECT valence, arousal, dominance FROM emotion_state WHERE id=1"
+    ).fetchone())
+    before_samples = upgraded.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone()[0]
+    upgraded.close()
+
+    history = RecordingHistory([_history_record(1)])
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, history),
+        now=lambda: NOW,
+    )
+    assert consumer.tick_once() is False
+    connection = sqlite3.connect(path)
+    assert tuple(connection.execute(
+        "SELECT valence, arousal, dominance FROM emotion_state WHERE id=1"
+    ).fetchone()) == before_state
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone()[0] == before_samples
+    receipt = connection.execute(
+        "SELECT source_type, valence_delta, dominance_delta, payload_json "
+        "FROM emotion_events WHERE source_event_id='pf_history_import:1'"
+    ).fetchone()
+    assert receipt[:3] == ("pf_history_import_terminal", 0.0, 0.0)
+    receipt_payload = json.loads(receipt[3])
+    assert receipt_payload["disposition"] == "legacy_event_already_applied"
+    assert receipt_payload["legacy_event_id"] == "proactive_feedback:1"
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (1,)
+    first_counts = (
+        connection.execute("SELECT count(*) FROM emotion_events").fetchone()[0],
+        connection.execute(
+            "SELECT count(*) FROM emotion_feedback_samples"
+        ).fetchone()[0],
+    )
+    connection.execute(
+        "UPDATE pf_history_cursor SET row_id=0 WHERE source='proactive_feedback'"
+    )
+    connection.commit()
+    connection.close()
+
+    assert consumer.tick_once() is False
+    connection = sqlite3.connect(path)
+    assert (
+        connection.execute("SELECT count(*) FROM emotion_events").fetchone()[0],
+        connection.execute(
+            "SELECT count(*) FROM emotion_feedback_samples"
+        ).fetchone()[0],
+    ) == first_counts
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (1,)
+    connection.close()
+
+    history.records.append(_history_record(2))
+    assert consumer.tick_once() is False
+    connection = sqlite3.connect(path)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone()[0] == before_samples + 1
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (2,)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_events "
+        "WHERE source_event_id='proactive_feedback:2'"
+    ).fetchone() == (1,)
+    connection.close()
+
+
+def test_legacy_pf_event_identity_collision_rolls_back(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    _create_formal_legacy_fixture(path)
+    _insert_legacy_pf_event(path, user_message_id="different-user")
+    upgraded = module.open_db(path)
+    before = (
+        upgraded.execute("SELECT count(*) FROM emotion_events").fetchone()[0],
+        upgraded.execute(
+            "SELECT payload_json FROM emotion_events "
+            "WHERE source_event_id='proactive_feedback:1'"
+        ).fetchone()[0],
+        tuple(upgraded.execute(
+            "SELECT valence, arousal, dominance FROM emotion_state WHERE id=1"
+        ).fetchone()),
+        upgraded.execute(
+            "SELECT count(*) FROM emotion_feedback_samples"
+        ).fetchone()[0],
+    )
+    upgraded.close()
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, RecordingHistory([_history_record(1)])),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="legacy identity 冲突"):
+        consumer.tick_once()
+    connection = sqlite3.connect(path)
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (0,)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_events "
+        "WHERE source_event_id='pf_history_import:1'"
+    ).fetchone() == (0,)
+    after = (
+        connection.execute("SELECT count(*) FROM emotion_events").fetchone()[0],
+        connection.execute(
+            "SELECT payload_json FROM emotion_events "
+            "WHERE source_event_id='proactive_feedback:1'"
+        ).fetchone()[0],
+        tuple(connection.execute(
+            "SELECT valence, arousal, dominance FROM emotion_state WHERE id=1"
+        ).fetchone()),
+        connection.execute(
+            "SELECT count(*) FROM emotion_feedback_samples"
+        ).fetchone()[0],
+    )
+    connection.close()
+    assert after == before
 
 
 def test_pf_explicit_quote_receipt_does_not_double_apply_direct_signal(

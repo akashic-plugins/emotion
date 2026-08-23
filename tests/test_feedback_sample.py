@@ -73,9 +73,9 @@ def test_typed_turn_feedback_is_readable_without_legacy_databases(tmp_path: Path
     assert result["found"] is True
     assert result["count"] == 1
     event = result["events"][0]
-    assert event["feedback_type"] == "topic_follow"
+    assert event["feedback_type"] == "explicit_quote"
     assert event["message_ids"] == {
-        "proactive": "proactive-sample-1",
+            "proactive": "",
         "user": "user-sample-1",
     }
     assert event["texts"] == {

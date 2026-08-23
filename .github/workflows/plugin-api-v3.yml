@@ -38,6 +38,11 @@ jobs:
           repository: kachofugetsu09/akashic-agent
           ref: 9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5
           path: .akashic-core
+      - uses: actions/checkout@v4
+        with:
+          repository: akashic-plugins/proactive_feedback
+          ref: 7784740d35856bdfa3d0cccd7ab93f8826130a86
+          path: .proactive-feedback
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -50,6 +55,7 @@ jobs:
       - name: Run focused plugin tests
         env:
           AKASHIC_AGENT_ROOT: .akashic-core
+          AKASHIC_PROACTIVE_FEEDBACK_ROOT: .proactive-feedback
           PYTHONPATH: .akashic-core
         run: python -m pytest -q tests
       - uses: actions/setup-node@v4
@@ -61,8 +67,12 @@ jobs:
         env:
           AKASHIC_AGENT_ROOT: .akashic-core
           PYTHONPATH: .akashic-core
-        run: pyright --level error plugin.py runtime.py dashboard.py db.py tests
+        run: >-
+          pyright --level error plugin.py runtime.py feedback_history.py
+          dashboard.py db.py tests
       - name: Compile Python sources
-        run: python -m compileall -q plugin.py runtime.py dashboard.py db.py drift tests
+        run: >-
+          python -m compileall -q plugin.py runtime.py feedback_history.py
+          dashboard.py db.py drift tests
       - name: Check diff formatting
         run: git diff --check

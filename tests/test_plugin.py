@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -20,6 +21,10 @@ from agent.plugin_composition import (
     CompositionRoot,
     PluginRuntime,
     PluginTimers,
+    RUNTIME_STARTED,
+    RUNTIME_STOPPING,
+    RuntimeStarted,
+    RuntimeStopping,
 )
 from agent.plugin_composition.tool_catalog import PluginTools, _freeze_plugin_tools
 from agent.plugin_composition.ui_slots import PluginUiSlots
@@ -156,6 +161,7 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
         "DRIFT_FINISHED",
         "ProactiveModule",
         "ProactiveDocuments",
+        'event.extra.get("proactive_feedback")',
     ):
         assert removed not in source
     db_source = (Path(__file__).parents[1] / "db.py").read_text(encoding="utf-8")
@@ -305,7 +311,7 @@ def test_formal_legacy_upgrade_is_atomic_and_preserves_all_rows(tmp_path: Path) 
     _create_formal_legacy_fixture(path)
     upgraded = module.open_db(path)
 
-    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 2
     assert upgraded.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 3
     assert upgraded.execute("SELECT count(*) FROM emotion_effects").fetchone()[0] == 5
     assert tuple(upgraded.execute(
@@ -342,7 +348,7 @@ def test_malformed_legacy_fails_before_ddl_and_can_retry_after_repair(tmp_path: 
 
     _create_formal_legacy_fixture(path)
     repaired = module.open_db(path)
-    assert repaired.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert repaired.execute("PRAGMA user_version").fetchone()[0] == 2
     assert repaired.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 3
     repaired.close()
 
@@ -599,6 +605,339 @@ async def _eventually(predicate: Any) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition did not settle")
+
+
+def _count_rows(path: Path, table: str) -> int:
+    with sqlite3.connect(path) as connection:
+        return int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+
+
+def _history_record(cursor: int, **changes: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "cursor": cursor,
+        "event_id": f"proactive_feedback:{cursor}",
+        "payload_hash": f"{cursor:064x}",
+        "session_key": "mobile:test",
+        "user_message_id": f"u{cursor}",
+        "assistant_message_id": f"a{cursor}",
+        "proactive_message_id": f"p{cursor}",
+        "feedback_type": "topic_follow",
+        "confidence": "high",
+        "pa_score": 0.8,
+        "pua_score": 0.7,
+        "lag_seconds": cursor,
+        "candidate_count": 1,
+        "matched_by": "pua",
+        "reason": "fixture",
+        "user_content_preview": "继续",
+        "assistant_content_preview": "回答",
+        "proactive_content_preview": "提醒",
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+class RecordingHistory:
+    def __init__(self, records: list[SimpleNamespace]) -> None:
+        self.records = records
+        self.requests: list[tuple[int, int]] = []
+
+    def page(self, *, after_cursor: int, max_items: int) -> SimpleNamespace:
+        self.requests.append((after_cursor, max_items))
+        records = tuple(
+            record for record in self.records if record.cursor > after_cursor
+        )[:max_items]
+        return SimpleNamespace(after_cursor=after_cursor, records=records)
+
+
+class FailOnceHistory(RecordingHistory):
+    def __init__(self, records: list[SimpleNamespace]) -> None:
+        super().__init__(records)
+        self.calls = 0
+
+    def page(self, *, after_cursor: int, max_items: int) -> SimpleNamespace:
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("temporary PF history I/O")
+        return super().page(after_cursor=after_cursor, max_items=max_items)
+
+
+async def _mount_formal_with_history(
+    tmp_path: Path,
+    *,
+    order: tuple[str, str],
+) -> tuple[CompositionRoot, ManualTimer, Path]:
+    root = CompositionRoot("emotion-pf-" + "-".join(order))
+    timer = ManualTimer()
+    tools = PluginTools(root.instance_token)
+    ui = PluginUiSlots()
+    drift = EmptyDrift()
+    history = RecordingHistory([_history_record(1)])
+    _ = await root.context.provide(TIMERS, PluginTimers(timer))
+    _ = await root.context.provide(TOOL_CATALOG, tools)
+    _ = await root.context.provide(UI_SLOTS, ui)
+    _ = await root.context.provide(module.DRIFT_PROPOSALS, drift)
+    _ = await root.context.provide(module.DRIFT_WAKE, drift)
+    emotion_root = tmp_path / "workspace" / "emotion"
+
+    async def mount_emotion() -> None:
+        _ = await root.mount(
+            lambda ctx: module.apply(ctx, object()),
+            name="emotion",
+            inject=module.inject,
+            runtime=PluginRuntime(
+                plugin_id="emotion",
+                plugin_dir=Path(__file__).parents[1],
+                data_dir=tmp_path / "plugin-data" / "emotion",
+                workspace=emotion_root.parent,
+                config=None,
+                workspace_roots=("emotion",),
+                data_access="read_write",
+            ),
+        )
+
+    async def mount_feedback() -> None:
+        async def provider(ctx: Any) -> None:
+            _ = await ctx.provide(module.PROACTIVE_FEEDBACK_HISTORY, history)
+
+        _ = await root.mount(provider, name="proactive_feedback")
+
+    for item in order:
+        await (mount_emotion() if item == "emotion" else mount_feedback())
+    _ = _freeze_plugin_tools(tools, root.instance_token, {"emotion": root.generation_id})
+    return root, timer, emotion_root
+
+
+def test_feedback_history_empty_page_creates_no_emotion_state(tmp_path: Path) -> None:
+    history = RecordingHistory([])
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, history),
+        now=lambda: NOW,
+    )
+
+    assert consumer.tick_once() is False
+    assert history.requests == [(0, 50)]
+    assert not (tmp_path / "emotion.db").exists()
+
+
+def test_feedback_history_page_is_atomic_idempotent_and_detects_hash_drift(
+    tmp_path: Path,
+) -> None:
+    history = RecordingHistory([_history_record(1), _history_record(2)])
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        cast(Any, history),
+        now=lambda: NOW,
+    )
+    assert consumer.tick_once() is False
+    assert consumer.tick_once() is False
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (2,)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone() == (2,)
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (2,)
+    connection.close()
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    connection.execute(
+        "UPDATE pf_history_cursor SET row_id=0 WHERE source='proactive_feedback'"
+    )
+    connection.commit()
+    connection.close()
+    history.records = [_history_record(1, payload_hash="f" * 64)]
+    with pytest.raises(RuntimeError, match="payload hash 漂移"):
+        consumer.tick_once()
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (0,)
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (2,)
+    connection.close()
+
+
+def test_pf_explicit_quote_receipt_does_not_double_apply_direct_signal(
+    tmp_path: Path,
+) -> None:
+    module._on_turn_committed(_feedback_turn(), root=tmp_path)
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    before = connection.execute(
+        "SELECT valence, dominance FROM emotion_state WHERE id=1"
+    ).fetchone()
+    assert connection.execute(
+        "SELECT source_plugin FROM emotion_events "
+        "WHERE source_event_id='emotion_explicit_quote:turn-feedback-1'"
+    ).fetchone() == ("emotion",)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone() == (1,)
+    connection.close()
+    record = _history_record(
+        1,
+        feedback_type="explicit_quote",
+        confidence="gold",
+        user_message_id="u1",
+        matched_by="explicit_quote",
+        reason="explicit_quote",
+    )
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()), tmp_path, PluginTimers.candidate_validation(),
+        cast(Any, RecordingHistory([record])), now=lambda: NOW,
+    )
+
+    assert consumer.tick_once() is False
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (2,)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone() == (1,)
+    terminal = connection.execute(
+        "SELECT source_type, reason, valence_delta, dominance_delta "
+        "FROM emotion_events WHERE source_event_id='proactive_feedback:1'"
+    ).fetchone()
+    assert terminal == (
+        "explicit_quote_already_applied",
+        "direct_quote_already_applied",
+        0.0,
+        0.0,
+    )
+    assert connection.execute(
+        "SELECT valence, dominance FROM emotion_state WHERE id=1"
+    ).fetchone() == before
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (1,)
+    connection.close()
+
+def test_feedback_history_page_failure_rolls_back_all_derived_facts(tmp_path: Path) -> None:
+    connection = module.open_db(tmp_path / "emotion.db")
+    connection.execute(
+        """
+        CREATE TRIGGER reject_second_feedback
+        BEFORE INSERT ON emotion_events
+        WHEN NEW.source_event_id = 'proactive_feedback:2'
+        BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END
+        """
+    )
+    connection.commit()
+    connection.close()
+    history = RecordingHistory([_history_record(1), _history_record(2)])
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, object()), tmp_path, PluginTimers.candidate_validation(),
+        cast(Any, history), now=lambda: NOW,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="fixture rejection"):
+        consumer.tick_once()
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (0,)
+    assert connection.execute(
+        "SELECT count(*) FROM emotion_feedback_samples"
+    ).fetchone() == (0,)
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (0,)
+    connection.execute("DROP TRIGGER reject_second_feedback")
+    connection.commit()
+    connection.close()
+    restarted = module.FeedbackHistoryConsumer(
+        cast(Any, object()), tmp_path, PluginTimers.candidate_validation(),
+        cast(Any, history), now=lambda: NOW,
+    )
+    assert restarted.tick_once() is False
+    connection = sqlite3.connect(tmp_path / "emotion.db")
+    assert connection.execute("SELECT count(*) FROM emotion_events").fetchone() == (2,)
+    assert connection.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone() == (2,)
+    connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order",
+    (("emotion", "feedback"), ("feedback", "emotion")),
+)
+async def test_feedback_history_composes_in_both_mount_orders_and_uses_timer(
+    tmp_path: Path,
+    order: tuple[str, str],
+) -> None:
+    root, timer, emotion_root = await _mount_formal_with_history(
+        tmp_path / "-".join(order), order=order
+    )
+    try:
+        await root.context.serial(RUNTIME_STARTED, RuntimeStarted())
+        await _eventually(lambda: len(timer.handles) >= 1)
+        feedback_timer = min(timer.handles, key=lambda handle: handle.deadline)
+        assert not (emotion_root / "emotion.db").exists() or _count_rows(
+            emotion_root / "emotion.db", "emotion_feedback_samples"
+        ) == 0
+        feedback_timer.fire()
+        await _eventually(
+            lambda: (emotion_root / "emotion.db").exists()
+            and _count_rows(
+                emotion_root / "emotion.db", "emotion_feedback_samples"
+            ) == 1
+        )
+        assert sum(not handle._future.done() for handle in timer.handles) == 2
+        await root.context.serial(RUNTIME_STOPPING, RuntimeStopping())
+        assert timer.active == 0
+    finally:
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_feedback_history_candidate_handshake_has_zero_timer_and_db(
+    tmp_path: Path,
+) -> None:
+    root, emotion_root = await _mount_candidate(tmp_path)
+    history = RecordingHistory([_history_record(1)])
+    try:
+        async def provider(ctx: Any) -> None:
+            _ = await ctx.provide(module.PROACTIVE_FEEDBACK_HISTORY, history)
+
+        _ = await root.mount(provider, name="proactive_feedback")
+        assert any(
+            fiber.name == "proactive-feedback-history" and fiber.state.value == "active"
+            for fiber in root.root_fiber.children
+            for fiber in fiber.children
+        )
+        assert history.requests == []
+        assert not (emotion_root / "emotion.db").exists()
+    finally:
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_feedback_history_transient_failure_rearms_and_recovers(
+    tmp_path: Path,
+) -> None:
+    timer = ManualTimer()
+    context = RecordingContext()
+    history = FailOnceHistory([_history_record(1)])
+    consumer = module.FeedbackHistoryConsumer(
+        cast(Any, context), tmp_path, PluginTimers(timer), cast(Any, history),
+        now=lambda: NOW,
+    )
+    await consumer.start()
+    await _eventually(lambda: len(timer.handles) == 1)
+    timer.handles[0].fire()
+    await _eventually(lambda: len(timer.handles) == 2)
+    assert context.incidents[0][0] == "emotion_feedback_history_transient"
+    assert not (tmp_path / "emotion.db").exists()
+    timer.handles[1].fire()
+    await _eventually(
+        lambda: (tmp_path / "emotion.db").exists()
+        and _count_rows(tmp_path / "emotion.db", "emotion_events") == 1
+    )
+    assert len(timer.handles) == 3
+    await consumer.close()
+    assert timer.active == 0
 
 
 @pytest.mark.asyncio

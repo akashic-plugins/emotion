@@ -57,7 +57,7 @@ class EmotionBehavior:
     expected_effect: str
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _TABLE_SQL = {
     "emotion_state": """
         CREATE TABLE emotion_state (
@@ -181,7 +181,15 @@ _TABLE_SQL = {
             PRIMARY KEY (proposal_id, revision)
         )
     """,
+    "pf_history_cursor": """
+        CREATE TABLE pf_history_cursor (
+            source TEXT PRIMARY KEY,
+            row_id INTEGER NOT NULL CHECK (row_id >= 0),
+            updated_at TEXT NOT NULL
+        )
+    """,
 }
+_VERSION_ONE_TABLES = frozenset(_TABLE_SQL).difference({"pf_history_cursor"})
 _LEGACY_TABLE_SETS = frozenset(
     {
         frozenset(),
@@ -203,6 +211,7 @@ _LEGACY_TABLE_SETS = frozenset(
                 "emotion_domain_effects",
             }
         ),
+        _VERSION_ONE_TABLES,
         frozenset(_TABLE_SQL),
     }
 )
@@ -238,6 +247,13 @@ def open_db(path: Path) -> sqlite3.Connection:
         )
         _ = conn.execute(
             """
+            INSERT OR IGNORE INTO pf_history_cursor(source, row_id, updated_at)
+            VALUES('proactive_feedback', 0, ?)
+            """,
+            (now,),
+        )
+        _ = conn.execute(
+            """
             INSERT OR IGNORE INTO emotion_preference_state(
                 id, context_text, processed_feedback_sample_id, updated_at
             ) VALUES(1, '', 0, ?)
@@ -264,7 +280,7 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
     """Accept only exact historical or current Emotion table topologies."""
 
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    if version not in {0, _SCHEMA_VERSION}:
+    if version not in {0, 1, _SCHEMA_VERSION}:
         raise RuntimeError(f"不支持的 Emotion schema version: {version}")
     tables = _owned_tables(conn)
     unknown = set(tables).difference(_TABLE_SQL)
@@ -275,6 +291,8 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
             raise RuntimeError(f"Emotion table schema 不匹配: {table_name}")
     if version == 0 and frozenset(tables) not in _LEGACY_TABLE_SETS:
         raise RuntimeError("Emotion legacy table set 不匹配")
+    if version == 1 and frozenset(tables) != _VERSION_ONE_TABLES:
+        raise RuntimeError("Emotion v1 table set 不匹配")
     if version == _SCHEMA_VERSION and frozenset(tables) != frozenset(_TABLE_SQL):
         raise RuntimeError("Emotion current table set 不匹配")
     check = conn.execute("PRAGMA quick_check").fetchone()
@@ -720,7 +738,182 @@ def apply_feedback(
     confidence: str,
     payload: dict[str, Any],
 ) -> EmotionState:
+    """Apply one Emotion-owned direct feedback signal and commit its history."""
+
+    state, _ = _apply_feedback(
+        conn,
+        source_plugin="emotion",
+        source_event_id=source_event_id,
+        session_key=session_key,
+        feedback_type=feedback_type,
+        confidence=confidence,
+        payload=payload,
+    )
+    conn.commit()
+    return state
+
+
+def apply_feedback_history_page(
+    conn: sqlite3.Connection,
+    records: list[dict[str, Any]],
+) -> int:
+    """Atomically apply one ordered PF page and advance its local cursor."""
+
+    # 1. Freeze the current cursor and validate the complete incoming page.
+    state = conn.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone()
+    if state is None:
+        raise RuntimeError("Emotion PF history cursor 缺失")
+    current = int(state["row_id"])
+    previous = current
+    for record in records:
+        cursor = _history_cursor(record)
+        if _history_text(record, "event_id") != f"proactive_feedback:{cursor}":
+            raise ValueError("PF history event_id 与 cursor 不一致")
+        if cursor <= previous:
+            raise ValueError("PF history page cursor 必须严格递增且晚于本地 cursor")
+        previous = cursor
+
+    # 2. Apply every accepted fact and its derived sample inside one transaction.
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for record in records:
+            event_id = _history_text(record, "event_id")
+            payload_hash = _history_hash(record)
+            payload = _history_payload(record, payload_hash)
+            existing = conn.execute(
+                "SELECT payload_json FROM emotion_events WHERE source_event_id=?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(str(existing["payload_json"]))
+                if not isinstance(stored, dict) or stored.get(
+                    "source_payload_hash"
+                ) != payload_hash:
+                    raise RuntimeError(f"PF history payload hash 漂移: {event_id}")
+            elif (
+                _history_text(record, "feedback_type") == "explicit_quote"
+                and _direct_quote_already_applied(
+                    conn,
+                    _history_text(record, "user_message_id"),
+                )
+            ):
+                _record_feedback_terminal(
+                    conn,
+                    source_event_id=event_id,
+                    session_key=_history_text(record, "session_key"),
+                    payload=payload,
+                )
+            else:
+                _apply_feedback(
+                    conn,
+                    source_plugin="proactive_feedback",
+                    source_event_id=event_id,
+                    session_key=_history_text(record, "session_key"),
+                    feedback_type=_history_text(record, "feedback_type"),
+                    confidence=_history_text(record, "confidence"),
+                    payload=payload,
+                )
+            current = _history_cursor(record)
+        if records:
+            _ = conn.execute(
+                """
+                UPDATE pf_history_cursor
+                SET row_id=?, updated_at=?
+                WHERE source='proactive_feedback'
+                """,
+                (current, datetime.now(timezone.utc).isoformat()),
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return current
+
+
+def read_feedback_history_cursor(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT row_id FROM pf_history_cursor WHERE source='proactive_feedback'"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Emotion PF history cursor 缺失")
+    return int(row["row_id"])
+
+
+def _direct_quote_already_applied(
+    conn: sqlite3.Connection,
+    user_message_id: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM emotion_events
+        WHERE source_plugin='emotion'
+          AND source_event_id LIKE 'emotion_explicit_quote:%'
+          AND source_type='explicit_quote'
+          AND json_extract(payload_json, '$.user_message_id') = ?
+        LIMIT 1
+        """,
+        (user_message_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _record_feedback_terminal(
+    conn: sqlite3.Connection,
+    *,
+    source_event_id: str,
+    session_key: str,
+    payload: dict[str, Any],
+) -> None:
+    """Record a PF receipt whose direct quote effect was already applied."""
+
+    state = get_state(conn)
+    _ = conn.execute(
+        """
+        INSERT INTO emotion_events (
+            source_plugin, source_event_id, source_type, session_key,
+            valence_before, arousal_before, dominance_before,
+            valence_delta, arousal_delta, dominance_delta,
+            valence_after, arousal_after, dominance_after,
+            reason, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?, ?, ?, ?)
+        """,
+        (
+            "proactive_feedback",
+            source_event_id,
+            "explicit_quote_already_applied",
+            session_key,
+            state.valence,
+            state.arousal,
+            state.dominance,
+            state.valence,
+            state.arousal,
+            state.dominance,
+            "direct_quote_already_applied",
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+
+
+def _apply_feedback(
+    conn: sqlite3.Connection,
+    *,
+    source_plugin: str,
+    source_event_id: str,
+    session_key: str,
+    feedback_type: str,
+    confidence: str,
+    payload: dict[str, Any],
+) -> tuple[EmotionState, bool]:
     before = get_state(conn)
+    existing = conn.execute(
+        "SELECT 1 FROM emotion_events WHERE source_event_id=?",
+        (source_event_id,),
+    ).fetchone()
+    if existing is not None:
+        return before, False
     delta = classify_feedback_delta(feedback_type, confidence)
     now = datetime.now(timezone.utc).isoformat()
     decayed = _decay(before, now)
@@ -730,9 +923,8 @@ def apply_feedback(
         dominance=_clamp(decayed.dominance + delta.dominance),
         updated_at=now,
     )
-    try:
-        _ = conn.execute(
-            """
+    _ = conn.execute(
+        """
             INSERT INTO emotion_events (
                 source_plugin, source_event_id, source_type, session_key,
                 valence_before, arousal_before, dominance_before,
@@ -741,27 +933,25 @@ def apply_feedback(
                 reason, payload_json
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "proactive_feedback",
-                source_event_id,
-                feedback_type,
-                session_key,
-                before.valence,
-                before.arousal,
-                before.dominance,
-                delta.valence,
-                0.0,
-                delta.dominance,
-                after.valence,
-                after.arousal,
-                after.dominance,
-                delta.reason,
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-    except sqlite3.IntegrityError:
-        return before
+        """,
+        (
+            source_plugin,
+            source_event_id,
+            feedback_type,
+            session_key,
+            before.valence,
+            before.arousal,
+            before.dominance,
+            delta.valence,
+            0.0,
+            delta.dominance,
+            after.valence,
+            after.arousal,
+            after.dominance,
+            delta.reason,
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
     if feedback_type in {"topic_follow", "explicit_quote"}:
         _insert_feedback_sample(
             conn,
@@ -772,8 +962,58 @@ def apply_feedback(
             payload=payload,
         )
     _save_state(conn, after)
-    conn.commit()
-    return after
+    return after, True
+
+
+def _history_cursor(record: dict[str, Any]) -> int:
+    value = record.get("cursor")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("PF history cursor 必须是正整数")
+    return value
+
+
+def _history_text(record: dict[str, Any], field: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"PF history {field} 必须是非空字符串")
+    return value
+
+
+def _history_hash(record: dict[str, Any]) -> str:
+    value = _history_text(record, "payload_hash")
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError("PF history payload_hash 必须是小写 sha256")
+    return value
+
+
+def _history_payload(
+    record: dict[str, Any],
+    payload_hash: str,
+) -> dict[str, Any]:
+    payload = {
+        field: record.get(field)
+        for field in (
+            "user_message_id",
+            "assistant_message_id",
+            "proactive_message_id",
+            "feedback_type",
+            "confidence",
+            "pa_score",
+            "pua_score",
+            "lag_seconds",
+            "candidate_count",
+            "matched_by",
+            "reason",
+            "user_content_preview",
+            "assistant_content_preview",
+            "proactive_content_preview",
+        )
+    }
+    payload["source_cursor"] = _history_cursor(record)
+    payload["source_payload_hash"] = payload_hash
+    return payload
 
 
 def _insert_feedback_sample(

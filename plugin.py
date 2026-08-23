@@ -23,6 +23,10 @@ from bus.events_lifecycle import TurnCommitted
 
 from .db import apply_feedback, open_db
 from .dashboard import EmotionDashboardReader
+from .feedback_history import (
+    PROACTIVE_FEEDBACK_HISTORY,
+    FeedbackHistoryConsumer,
+)
 from .runtime import DriftProposalServices, DriftWakeServices, EmotionRuntime
 
 api_version = 3
@@ -84,7 +88,24 @@ async def apply(ctx: Context, config: object) -> None:
     await ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
     await ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
 
-    # 4. Mobile 只读查询与静态资源绑定到同一个 generation Root。
+    # 4. PF history is an optional pull composition with its own Timer/Fiber.
+    async def apply_feedback_history(child: Context) -> None:
+        consumer = FeedbackHistoryConsumer(
+            child,
+            emotion_root,
+            child.require(TIMERS),
+            child.require(PROACTIVE_FEEDBACK_HISTORY),
+        )
+        await child.on(RUNTIME_STARTED, lambda _: consumer.start())
+        await child.on(RUNTIME_STOPPING, lambda _: consumer.close())
+
+    _ = await ctx.inject(
+        (TIMERS, PROACTIVE_FEEDBACK_HISTORY),
+        apply_feedback_history,
+        name="proactive-feedback-history",
+    )
+
+    # 5. Mobile 只读查询与静态资源绑定到同一个 generation Root。
     def mobile_query(
         method: str,
         payload: dict[str, object],
@@ -124,7 +145,7 @@ def _on_turn_committed(
 
     if runtime is not None:
         runtime.observe_turn(event)
-    feedback = _feedback_from_turn(event)
+    feedback = _explicit_quote_feedback_from_turn(event)
     if feedback is None:
         return
     root = _require_v3_emotion_root() if root is None else root
@@ -142,50 +163,11 @@ def _on_turn_committed(
         conn.close()
 
 
-def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
-    """Read an optional typed feedback result, with explicit quote as the local fallback."""
+def _explicit_quote_feedback_from_turn(
+    event: TurnCommitted,
+) -> dict[str, Any] | None:
+    """Project Emotion's direct explicit-quote signal in its own namespace."""
 
-    raw = event.extra.get("proactive_feedback")
-    if isinstance(raw, Mapping):
-        feedback_type = raw.get("feedback_type")
-        confidence = raw.get("confidence")
-        if isinstance(feedback_type, str) and isinstance(confidence, str):
-            source = raw.get("event_id") or event.turn_id or event.persisted_user_message_id
-            if isinstance(source, str) and source:
-                payload = {
-                    "feedback_event_id": str(source),
-                    "user_message_id": event.persisted_user_message_id,
-                    "assistant_message_id": event.assistant_message_id,
-                    "proactive_message_id": raw.get("proactive_message_id"),
-                    "feedback_type": feedback_type,
-                    "confidence": confidence,
-                    "pua_score": raw.get("pua_score"),
-                    "lag_seconds": raw.get("lag_seconds"),
-                    "matched_by": raw.get("matched_by", "typed_turn"),
-                    "candidate_count": raw.get("candidate_count"),
-                    "pa_score": raw.get("pa_score"),
-                    "reason": raw.get("reason", "typed_turn"),
-                    "user_content_preview": _feedback_preview(
-                        raw.get("user_content_preview")
-                        or event.persisted_user_message
-                        or event.input_message
-                    ),
-                    "assistant_content_preview": _feedback_preview(
-                        raw.get("assistant_content_preview") or event.assistant_response
-                    ),
-                    "proactive_content_preview": _feedback_preview(
-                        raw.get("proactive_content_preview")
-                        or _quoted_proactive_text(event.input_message)
-                    ),
-                }
-                return {
-                    "source_event_id": f"proactive_feedback:{source}",
-                    "feedback_type": feedback_type,
-                    "confidence": confidence,
-                    "payload": payload,
-                }
-
-    # A quote is already an explicit feedback signal carried by the committed user message.
     marker = "【你当前新消息】"
     source = event.turn_id or event.persisted_user_message_id
     if marker not in event.input_message or not isinstance(source, str) or not source:
@@ -212,7 +194,7 @@ def _feedback_from_turn(event: TurnCommitted) -> dict[str, Any] | None:
         ),
     }
     return {
-        "source_event_id": f"proactive_feedback:{source}",
+        "source_event_id": f"emotion_explicit_quote:{source}",
         "feedback_type": "explicit_quote",
         "confidence": "gold",
         "payload": payload,

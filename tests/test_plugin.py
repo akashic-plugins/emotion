@@ -158,6 +158,17 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
         "ProactiveDocuments",
     ):
         assert removed not in source
+    db_source = (Path(__file__).parents[1] / "db.py").read_text(encoding="utf-8")
+    for removed_write in (
+        "class EmotionDomainEffect",
+        "def build_effect(",
+        "def commit_domain_effect(",
+        "def lookup_domain_effect(",
+        "def lookup_domain_effect_path(",
+        "INSERT INTO emotion_effects",
+        "INSERT INTO emotion_domain_effects",
+    ):
+        assert removed_write not in db_source
 
 
 @pytest.mark.asyncio
@@ -209,43 +220,160 @@ async def test_empty_tick_overwrites_current_without_appending_history(tmp_path:
     conn.close()
 
 
-def test_legacy_effect_tables_are_frozen_and_preserved_on_upgrade(tmp_path: Path) -> None:
-    path = tmp_path / "emotion.db"
-    conn = module.open_db(path)
-    conn.execute("DROP TABLE emotion_context_current")
-    conn.execute("DROP TABLE emotion_preference_state")
-    conn.execute("DROP TABLE emotion_drift_runs")
-    conn.execute(
+def _create_formal_legacy_fixture(path: Path) -> None:
+    """Create the exact original three-table formal schema without new migration code."""
+
+    conn = sqlite3.connect(path)
+    conn.executescript(
         """
-        INSERT INTO emotion_effects(
-            tick_id, session_key, valence, arousal, dominance,
-            base_threshold, final_threshold, threshold_delta,
-            tone_label, expected_effect, prompt_section, metadata_json
-        ) VALUES('legacy-tick', 'legacy', 0, 0, 0, 0.6, 0.6, 0,
-                 '平静', 'frozen', 'legacy prompt', '{}')
+        CREATE TABLE emotion_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            valence REAL NOT NULL,
+            arousal REAL NOT NULL,
+            dominance REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE emotion_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            source_plugin TEXT NOT NULL,
+            source_event_id TEXT NOT NULL UNIQUE,
+            source_type TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            valence_before REAL NOT NULL,
+            arousal_before REAL NOT NULL,
+            dominance_before REAL NOT NULL,
+            valence_delta REAL NOT NULL,
+            arousal_delta REAL NOT NULL,
+            dominance_delta REAL NOT NULL,
+            valence_after REAL NOT NULL,
+            arousal_after REAL NOT NULL,
+            dominance_after REAL NOT NULL,
+            reason TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE TABLE emotion_effects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            tick_id TEXT NOT NULL UNIQUE,
+            session_key TEXT NOT NULL,
+            valence REAL NOT NULL,
+            arousal REAL NOT NULL,
+            dominance REAL NOT NULL,
+            base_threshold REAL NOT NULL,
+            final_threshold REAL NOT NULL,
+            threshold_delta REAL NOT NULL,
+            tone_label TEXT NOT NULL,
+            expected_effect TEXT NOT NULL,
+            prompt_section TEXT NOT NULL,
+            metadata_json TEXT NOT NULL
+        );
+        INSERT INTO emotion_state VALUES(1, 0.2, -0.1, 0.3, '2026-08-20T00:00:00+00:00');
         """
     )
-    conn.execute(
-        """
-        INSERT INTO emotion_domain_effects(
-            semantic_job_id, event_id, invocation_id, effect_id,
-            idempotency_key, attempt, result_digest
-        ) VALUES('job', 'event', 'invocation', 'effect', 'key', 1, 'digest')
-        """
-    )
+    for index in range(3):
+        conn.execute(
+            """
+            INSERT INTO emotion_events(
+                source_plugin, source_event_id, source_type, session_key,
+                valence_before, arousal_before, dominance_before,
+                valence_delta, arousal_delta, dominance_delta,
+                valence_after, arousal_after, dominance_after, reason, payload_json
+            ) VALUES('legacy', ?, 'feedback', 'legacy', 0, 0, 0,
+                     0.1, 0, 0.1, 0.1, 0, 0.1, 'legacy', '{}')
+            """,
+            (f"legacy-event-{index}",),
+        )
+    for index in range(5):
+        conn.execute(
+            """
+            INSERT INTO emotion_effects(
+                tick_id, session_key, valence, arousal, dominance,
+                base_threshold, final_threshold, threshold_delta,
+                tone_label, expected_effect, prompt_section, metadata_json
+            ) VALUES(?, 'legacy', 0, 0, 0, 0.6, 0.6, 0,
+                     '平静', 'frozen', 'legacy prompt', '{}')
+            """,
+            (f"legacy-tick-{index}",),
+        )
     conn.commit()
     conn.close()
 
+
+def test_formal_legacy_upgrade_is_atomic_and_preserves_all_rows(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    _create_formal_legacy_fixture(path)
     upgraded = module.open_db(path)
-    assert [tuple(row) for row in upgraded.execute(
-        "SELECT tick_id, prompt_section FROM emotion_effects"
-    ).fetchall()] == [("legacy-tick", "legacy prompt")]
-    assert [tuple(row) for row in upgraded.execute(
-        "SELECT semantic_job_id, result_digest FROM emotion_domain_effects"
-    ).fetchall()] == [("job", "digest")]
+
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert upgraded.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 3
+    assert upgraded.execute("SELECT count(*) FROM emotion_effects").fetchone()[0] == 5
+    assert tuple(upgraded.execute(
+        "SELECT valence, arousal, dominance FROM emotion_state WHERE id=1"
+    ).fetchone()) == (0.2, -0.1, 0.3)
     assert upgraded.execute("SELECT count(*) FROM emotion_context_current").fetchone()[0] == 0
     assert upgraded.execute("SELECT count(*) FROM emotion_preference_state").fetchone()[0] == 1
+    assert upgraded.execute("SELECT count(*) FROM emotion_domain_effects").fetchone()[0] == 0
     upgraded.close()
+
+
+def test_malformed_legacy_fails_before_ddl_and_can_retry_after_repair(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE emotion_state(value TEXT)")
+    conn.execute("INSERT INTO emotion_state VALUES('unmodified')")
+    conn.commit()
+    conn.close()
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="Emotion table schema 不匹配: emotion_state"):
+        _ = module.open_db(path)
+    assert path.read_bytes() == original_bytes
+    check = sqlite3.connect(path)
+    assert check.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall() == [("emotion_state",)]
+    assert check.execute("SELECT value FROM emotion_state").fetchall() == [
+        ("unmodified",)
+    ]
+    check.execute("DROP TABLE emotion_state")
+    check.commit()
+    check.close()
+
+    _create_formal_legacy_fixture(path)
+    repaired = module.open_db(path)
+    assert repaired.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert repaired.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 3
+    repaired.close()
+
+
+def test_removed_legacy_write_api_cannot_mutate_frozen_tables(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    _create_formal_legacy_fixture(path)
+    conn = module.open_db(path)
+    before = (
+        conn.execute("SELECT count(*) FROM emotion_effects").fetchone()[0],
+        conn.execute("SELECT count(*) FROM emotion_domain_effects").fetchone()[0],
+    )
+    conn.close()
+
+    db_module = sys.modules["test_emotion_plugin.db"]
+    for removed in (
+        "EmotionDomainEffect",
+        "build_effect",
+        "commit_domain_effect",
+        "lookup_domain_effect",
+        "lookup_domain_effect_path",
+    ):
+        assert not hasattr(db_module, removed)
+
+    reopened = module.open_db(path)
+    after = (
+        reopened.execute("SELECT count(*) FROM emotion_effects").fetchone()[0],
+        reopened.execute("SELECT count(*) FROM emotion_domain_effects").fetchone()[0],
+    )
+    reopened.close()
+    assert after == before == (5, 0)
 
 
 @pytest.mark.asyncio

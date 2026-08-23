@@ -1,52 +1,32 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib.util
 import inspect
-import os
-import shutil
-import subprocess
+import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from agent.control.timer import TimerReceipt, TimerStatus
+from agent.lifecycle.types import BeforeTurnCtx
 from agent.plugin_composition import (
-    BACKGROUND_JOBS,
-    PROACTIVE_COMPONENTS,
+    TIMERS,
+    TOOL_CATALOG,
     UI_SLOTS,
     CompositionRoot,
     PluginRuntime,
+    PluginTimers,
 )
-from agent.plugin_composition.background_jobs import (
-    PluginBackgroundJobs,
-    _freeze_plugin_background_jobs,
-)
-from agent.plugin_composition.proactive import (
-    PluginProactiveComponents,
-    _freeze_plugin_proactive_components,
-)
+from agent.plugin_composition.tool_catalog import PluginTools, _freeze_plugin_tools
 from agent.plugin_composition.ui_slots import PluginUiSlots
-from agent.plugins.generation_activity_host import ActivityHost
-from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
-from agent.plugins.generation_proactive_host import (
-    ProactiveActivityAdapter,
-    ProactiveModuleOutcome,
-)
-from agent.plugins.manager import PluginManager
-from agent.plugins.proactive_documents import (
-    ProactiveDocumentDigests,
-    ProactiveDocumentPair,
-)
-from bus.events_lifecycle import DriftFinished, TurnCommitted
-from bus.event_bus import EventBus
-from proactive_v2.frame import ProactiveTickInput
+from bus.events_lifecycle import TurnCommitted
+from plugins.drift.store import DriftStore
 
-ProactiveFrame = ProactiveModuleOutcome
+NOW = datetime(2026, 8, 23, 8, tzinfo=UTC)
 
 
 def _load_plugin_module():
@@ -65,152 +45,70 @@ def _load_plugin_module():
 
 
 module = _load_plugin_module()
-async def _mount_runtime(tmp_path: Path) -> tuple[CompositionRoot, Path]:
-    workspace = tmp_path / "workspace"
-    emotion_root = workspace / "emotion"
-    emotion_root.mkdir(parents=True)
-    root = CompositionRoot("emotion-v3")
-    jobs = PluginBackgroundJobs(root.instance_token)
-    proactive = PluginProactiveComponents(root.instance_token)
+refresh_current_context = sys.modules[
+    "test_emotion_plugin.db"
+].refresh_current_context
+
+
+class DriftServices:
+    """Expose both ordinary Drift ports over the real Core store."""
+
+    def __init__(self, path: Path) -> None:
+        self.store = DriftStore(path)
+        self.store.initialize()
+
+    def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
+        return self.store.propose(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    def selection(self, accepted_turn: dict[str, object]) -> dict[str, object] | None:
+        return self.store.selection(accepted_turn)
+
+
+class EmptyDrift:
+    def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
+        return {"inserted": True}
+
+    def selection(self, accepted_turn: object) -> None:
+        return None
+
+
+async def _mount_candidate(tmp_path: Path) -> tuple[CompositionRoot, Path]:
+    """Mount the real plugin with candidate Timer and ordinary service atoms."""
+
+    root = CompositionRoot("emotion-candidate")
+    tools = PluginTools(root.instance_token)
     ui = PluginUiSlots()
-    _ = await root.context.provide(BACKGROUND_JOBS, jobs)
-    _ = await root.context.provide(PROACTIVE_COMPONENTS, proactive)
+    drift = EmptyDrift()
+    _ = await root.context.provide(TIMERS, PluginTimers.candidate_validation())
+    _ = await root.context.provide(TOOL_CATALOG, tools)
     _ = await root.context.provide(UI_SLOTS, ui)
+    _ = await root.context.provide(module.DRIFT_PROPOSALS, drift)
+    _ = await root.context.provide(module.DRIFT_WAKE, drift)
+    emotion_root = tmp_path / "workspace" / "emotion"
+    _ = await root.mount(
+        lambda ctx: module.apply(ctx, object()),
+        name="emotion",
+        inject=module.inject,
+        runtime=PluginRuntime(
+            plugin_id="emotion",
+            plugin_dir=Path(__file__).parents[1],
+            data_dir=tmp_path / "plugin-data",
+            workspace=emotion_root.parent,
+            config=None,
+            workspace_roots=("emotion",),
+            data_access="read_only",
+        ),
+    )
+    _ = _freeze_plugin_tools(
+        tools,
+        root.instance_token,
+        {"emotion": root.generation_id},
+    )
     return root, emotion_root
 
 
-def _copy_emotion_plugin(tmp_path: Path) -> Path:
-    """Copy the plugin into an isolated discovery root for Manager tests."""
-
-    source = Path(__file__).parents[1]
-    target = tmp_path / "plugins" / "emotion"
-    shutil.copytree(
-        source,
-        target,
-        ignore=shutil.ignore_patterns(
-            ".git", ".akashic-core", "__pycache__", ".pytest_cache"
-        ),
-    )
-    return target
-
-
-async def _start_emotion_manager(
-    tmp_path: Path,
-    plugin_dir: Path | None = None,
-) -> PluginManager:
-    """Boot one real Manager generation with Core's ActivityHost owner."""
-
-    plugin_dir = plugin_dir or _copy_emotion_plugin(tmp_path)
-    manager = PluginManager(
-        plugin_dirs=[plugin_dir.parent],
-        event_bus=EventBus(),
-        tool_registry=None,
-        workspace=tmp_path / "workspace",
-        installed_cache_root=tmp_path / "cache",
-    )
-    manager.bind_activity_host(ActivityHost((ProactiveActivityAdapter(),)))
-    await manager.load_all()
-    return manager
-
-
-async def _run_manager_tick(
-    manager: PluginManager,
-    frame: ProactiveFrame,
-) -> ProactiveFrame:
-    """Run one proactive module through the exact stable Root and lease."""
-
-    snapshot = manager.current_snapshot
-    activity = manager.activity_host
-    if snapshot is None or activity is None:
-        raise AssertionError("Manager 未发布 stable snapshot/activity")
-    lease = await manager.snapshot_store.acquire(snapshot.snapshot_id)
-    admission = activity.acquire(lease)
-    bridge = CommittedProactiveBridge(activity)
-    token = bridge.bind_execution(lease)
-    try:
-        runtime = bridge.runtime_for(snapshot)
-        modules = bridge.lifecycle_modules(
-            runtime,
-            lifecycle_id="default.proactive.frame.v1",
-        )
-        if len(modules) != 1:
-            raise AssertionError(f"Emotion proactive module 数量异常: {len(modules)}")
-        return await cast(Any, modules[0]).run(frame)
-    finally:
-        bridge.reset_execution(token)
-        await admission.release()
-        await lease.release()
-
-
-def test_module_exports_pure_v3_contract() -> None:
-    assert module.api_version == 3
-    assert module.name == "emotion"
-    assert module.version == "3.0.0"
-    assert inspect.signature(module.apply).parameters.keys() == {"ctx", "config"}
-    module_file = module.__file__
-    assert isinstance(module_file, str)
-    source = Path(module_file).read_text(encoding="utf-8")
-    db_source = Path(module_file).with_name("db.py").read_text(encoding="utf-8")
-    assert "class EmotionPlugin" not in source
-    assert "ProactiveFeedbackRecorded" not in source
-    production_source = f"{source}\n{db_source}"
-    assert "proactive_v2.frame" not in production_source
-    assert "proactive_v2.energy" not in production_source
-    assert "EventBus" not in source
-    assert "from agent.plugins import" not in source
-
-
-@pytest.mark.asyncio
-async def test_v3_apply_freezes_all_catalogs_without_opening_db(tmp_path: Path) -> None:
-    root, emotion_root = await _mount_runtime(tmp_path)
-    _ = await root.mount(
-        lambda ctx: module.apply(ctx, object()),
-        name="emotion",
-        inject=(BACKGROUND_JOBS, PROACTIVE_COMPONENTS, UI_SLOTS),
-        runtime=PluginRuntime(
-            plugin_id="emotion",
-            plugin_dir=Path(__file__).parents[1],
-            data_dir=tmp_path / "plugin-data",
-            workspace=emotion_root.parent,
-            config=None,
-            workspace_roots=("emotion",),
-        ),
-    )
-    jobs = root.context.get(BACKGROUND_JOBS)
-    proactive = root.context.get(PROACTIVE_COMPONENTS)
-    assert jobs is not None and proactive is not None
-    job_catalog = _freeze_plugin_background_jobs(jobs, root.instance_token)
-    proactive_catalog = _freeze_plugin_proactive_components(
-        proactive,
-        root.instance_token,
-    )
-    assert job_catalog.job("emotion:merge_proactive_pending") is not None
-    module_binding = proactive_catalog.module("emotion:proactive.prompt.emotion")
-    assert module_binding is not None
-    assert module_binding.definition.domain_effect == "emotion.state"
-    assert not (emotion_root / "emotion.db").exists()
-    await root.dispose()
-
-
-@pytest.mark.asyncio
-async def test_typed_turn_feedback_is_idempotent_and_mobile_read_only(
-    tmp_path: Path,
-) -> None:
-    root, emotion_root = await _mount_runtime(tmp_path)
-    _ = await root.mount(
-        lambda ctx: module.apply(ctx, object()),
-        name="emotion",
-        inject=(BACKGROUND_JOBS, PROACTIVE_COMPONENTS, UI_SLOTS),
-        runtime=PluginRuntime(
-            plugin_id="emotion",
-            plugin_dir=Path(__file__).parents[1],
-            data_dir=tmp_path / "plugin-data",
-            workspace=emotion_root.parent,
-            config=None,
-            workspace_roots=("emotion",),
-        ),
-    )
-    event = TurnCommitted(
+def _feedback_turn(turn_id: str = "turn-feedback-1") -> TurnCommitted:
+    return TurnCommitted(
         session_key="mobile:test",
         channel="test",
         chat_id="chat",
@@ -218,570 +116,425 @@ async def test_typed_turn_feedback_is_idempotent_and_mobile_read_only(
         persisted_user_message="被回复消息：主动提醒某个主题\n\n【你当前新消息】继续这个主题",
         assistant_response="继续回答",
         tools_used=[],
-        turn_id="turn-1",
+        turn_id=turn_id,
         persisted_user_message_id="u1",
         assistant_message_id="a1",
+        timestamp=NOW,
     )
-    module._on_turn_committed(event)
-    module._on_turn_committed(event)
-    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*") if path.is_file())
-    bootstrap = module._mobile_ui_query(
+
+
+def _before_turn(channel: str, at: datetime) -> BeforeTurnCtx:
+    return BeforeTurnCtx(
+        session_key="wake:default",
+        channel=channel,
+        chat_id="chat",
+        content="tick",
+        timestamp=at,
+        retrieved_memory_block="",
+        retrieval_trace_raw=None,
+        history_messages=(),
+    )
+
+
+def test_module_uses_only_ordinary_v3_atoms() -> None:
+    assert module.api_version == 3
+    assert inspect.signature(module.apply).parameters.keys() == {"ctx", "config"}
+    assert module.inject == (
+        TIMERS,
+        TOOL_CATALOG,
+        UI_SLOTS,
+        module.DRIFT_PROPOSALS,
+        module.DRIFT_WAKE,
+    )
+    source = "\n".join(
+        (Path(__file__).parents[1] / name).read_text(encoding="utf-8")
+        for name in ("plugin.py", "runtime.py")
+    )
+    for removed in (
+        "PROACTIVE_COMPONENTS",
+        "BACKGROUND_JOBS",
+        "DRIFT_FINISHED",
+        "ProactiveModule",
+        "ProactiveDocuments",
+    ):
+        assert removed not in source
+
+
+@pytest.mark.asyncio
+async def test_candidate_mount_has_zero_timer_and_zero_workspace_write(tmp_path: Path) -> None:
+    root, emotion_root = await _mount_candidate(tmp_path)
+    assert not emotion_root.exists()
+    assert not list(tmp_path.rglob("*.db"))
+    await root.dispose()
+
+
+def test_feedback_history_is_idempotent_and_mobile_is_read_only(tmp_path: Path) -> None:
+    emotion_root = tmp_path / "emotion"
+    event = _feedback_turn()
+    module._on_turn_committed(event, root=emotion_root)
+    module._on_turn_committed(event, root=emotion_root)
+    before = (emotion_root / "emotion.db").read_bytes()
+    projection = module._mobile_ui_query(
         "emotion.bootstrap",
         {"limit": 10},
         session_id=None,
         turn_id=None,
+        root=emotion_root,
     )
-    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*") if path.is_file())
+    after = (emotion_root / "emotion.db").read_bytes()
+    assert projection["overview"]["event_count"] == 1
+    assert projection["overview"]["influence_count"] == 1
     assert before == after
-    assert bootstrap["overview"]["event_count"] == 1
-    assert bootstrap["overview"]["influence_count"] == 1
-    assert bootstrap["items"][0]["source_type"] == "explicit_quote"
-    await root.dispose()
 
 
 @pytest.mark.asyncio
-async def test_proactive_projection_requires_and_uses_domain_effect_facade(
+async def test_empty_tick_overwrites_current_without_appending_history(tmp_path: Path) -> None:
+    drift = EmptyDrift()
+    runtime = module.EmotionRuntime(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        drift,
+        drift,
+        now=lambda: NOW,
+    )
+    await runtime.tick_once()
+    await runtime.tick_once()
+
+    conn = sqlite3.connect(tmp_path / "emotion.db")
+    assert conn.execute("SELECT count(*) FROM emotion_context_current").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM emotion_drift_runs").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM emotion_feedback_samples").fetchone()[0] == 0
+    conn.close()
+
+
+def test_legacy_effect_tables_are_frozen_and_preserved_on_upgrade(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    conn = module.open_db(path)
+    conn.execute("DROP TABLE emotion_context_current")
+    conn.execute("DROP TABLE emotion_preference_state")
+    conn.execute("DROP TABLE emotion_drift_runs")
+    conn.execute(
+        """
+        INSERT INTO emotion_effects(
+            tick_id, session_key, valence, arousal, dominance,
+            base_threshold, final_threshold, threshold_delta,
+            tone_label, expected_effect, prompt_section, metadata_json
+        ) VALUES('legacy-tick', 'legacy', 0, 0, 0, 0.6, 0.6, 0,
+                 '平静', 'frozen', 'legacy prompt', '{}')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO emotion_domain_effects(
+            semantic_job_id, event_id, invocation_id, effect_id,
+            idempotency_key, attempt, result_digest
+        ) VALUES('job', 'event', 'invocation', 'effect', 'key', 1, 'digest')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    upgraded = module.open_db(path)
+    assert [tuple(row) for row in upgraded.execute(
+        "SELECT tick_id, prompt_section FROM emotion_effects"
+    ).fetchall()] == [("legacy-tick", "legacy prompt")]
+    assert [tuple(row) for row in upgraded.execute(
+        "SELECT semantic_job_id, result_digest FROM emotion_domain_effects"
+    ).fetchall()] == [("job", "digest")]
+    assert upgraded.execute("SELECT count(*) FROM emotion_context_current").fetchone()[0] == 0
+    assert upgraded.execute("SELECT count(*) FROM emotion_preference_state").fetchone()[0] == 1
+    upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_context_appends_only_to_wake(tmp_path: Path) -> None:
+    drift = EmptyDrift()
+    runtime = module.EmotionRuntime(
+        cast(Any, object()),
+        tmp_path,
+        PluginTimers.candidate_validation(),
+        drift,
+        drift,
+        now=lambda: NOW,
+    )
+    db = module.open_db(tmp_path / "emotion.db")
+    refresh_current_context(db, now=NOW)
+    db.close()
+
+    wake = _before_turn("wake", NOW + timedelta(minutes=1))
+    wake.extra_hints.append("existing")
+    runtime.prepare_context(wake)
+    assert wake.extra_hints[0] == "existing"
+    assert wake.extra_hints[1].startswith("Emotion current:\n")
+    assert wake.abort is False
+
+    passive = _before_turn("mobile", NOW + timedelta(minutes=1))
+    runtime.prepare_context(passive)
+    assert passive.extra_hints == []
+    stale = _before_turn("wake", NOW + timedelta(minutes=11))
+    runtime.prepare_context(stale)
+    assert stale.extra_hints == []
+
+
+@pytest.mark.asyncio
+async def test_real_drift_replays_then_revises_and_commits_without_history_loss(
     tmp_path: Path,
 ) -> None:
     emotion_root = tmp_path / "emotion"
-    emotion_root.mkdir()
-    projection = module.EmotionProjectionModule(emotion_root)
-    frame = ProactiveFrame(
-        input=ProactiveTickInput(
-            session_key="proactive:test",
-            started_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
+    module._on_turn_committed(_feedback_turn(), root=emotion_root)
+    drift = DriftServices(tmp_path / "drift.sqlite3")
+    runtime = module.EmotionRuntime(
+        cast(Any, object()),
+        emotion_root,
+        PluginTimers.candidate_validation(),
+        drift,
+        drift,
+        now=lambda: NOW,
+    )
+
+    await runtime.tick_once()
+    await runtime.tick_once()
+    snapshot = cast(
+        tuple[dict[str, Any], ...],
+        drift.store.snapshot(NOW)["proposals"],
+    )
+    assert len(snapshot) == 1
+    first = snapshot[0]
+    first_turn = {"session_id": "wake:default", "turn_id": "wake-1"}
+    selected = drift.store.select(first["ref"], first_turn, NOW)
+    runtime.observe_turn(
+        TurnCommitted(
+            session_key="wake:default",
+            channel="wake",
+            chat_id="chat",
+            input_message="tick",
+            persisted_user_message="tick",
+            assistant_response="没有调用提交工具",
+            tools_used=[],
+            turn_id="wake-1",
+            timestamp=NOW,
         )
     )
-    calls: list[str] = []
-
-    class Effects:
-        async def run(self, effect_id: str, transaction):
-            calls.append(effect_id)
-            effect_context = SimpleNamespace(
-                semantic_job_id="emotion:proactive.prompt.emotion",
-                event_id="proactive:test:2026-08-17T00:00:00+00:00",
-                invocation_id=(
-                    "proactive:emotion:proactive.prompt.emotion:"
-                    "proactive:test:2026-08-17T00:00:00+00:00"
-                ),
-                effect_id=effect_id,
-                idempotency_key=(
-                    "proactive:test:2026-08-17T00:00:00+00:00:"
-                    "emotion:proactive.prompt.emotion"
-                ),
-                attempt=1,
-                tick_id="proactive:test:2026-08-17T00:00:00+00:00",
-            )
-            result = transaction(effect_context)
-            if inspect.isawaitable(result):
-                await result
-            return object()
-
-    result = await projection.run(SimpleNamespace(domain_effects=Effects()), frame)
-    assert result.slots["proactive:prompt:system_bottom:emotion"]
-    assert result.slots["proactive:effect:emotion"]["metadata"]["expected_effect"] == "tone_only"
-    assert calls == ["emotion.state"]
-    db = module.open_db(emotion_root / "emotion.db")
-    try:
-        assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0] == 1
-    finally:
-        db.close()
-    with pytest.raises(RuntimeError, match="domain effects facade"):
-        await projection.run(SimpleNamespace(domain_effects=None), frame)
-
-
-@pytest.mark.asyncio
-async def test_manager_proactive_failure_rolls_back_then_retries_idempotently(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = await _start_emotion_manager(tmp_path)
-    try:
-        generation = manager.generation("emotion")
-        assert generation is not None
-        plugin_module = cast(Any, generation.instance).module
-        frame = ProactiveFrame(
-            input=ProactiveTickInput(
-                session_key="proactive:emotion",
-                started_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
-            )
-        )
-        original_build_effect = plugin_module.build_effect
-
-        def fail_after_writes(conn, **kwargs):
-            result = original_build_effect(conn, **kwargs)
-            raise RuntimeError("synthetic precommit failure")
-
-        monkeypatch.setattr(plugin_module, "build_effect", fail_after_writes)
-        with pytest.raises(RuntimeError, match="synthetic precommit failure"):
-            await _run_manager_tick(manager, frame)
-
-        db = module.open_db(tmp_path / "workspace" / "emotion" / "emotion.db")
-        try:
-            assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 0
-            assert (
-                db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0]
-                == 0
-            )
-            state = db.execute(
-                "SELECT valence, arousal, dominance FROM emotion_state WHERE id = 1"
-            ).fetchone()
-            assert state is not None and tuple(state) == (0.0, 0.0, 0.0)
-        finally:
-            db.close()
-
-        monkeypatch.setattr(plugin_module, "build_effect", original_build_effect)
-        first = await _run_manager_tick(manager, frame)
-        second = await _run_manager_tick(manager, frame)
-        assert first.slots["proactive:effect:emotion"] == second.slots[
-            "proactive:effect:emotion"
-        ]
-
-        db = module.open_db(tmp_path / "workspace" / "emotion" / "emotion.db")
-        try:
-            assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 1
-            assert (
-                db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0]
-                == 1
-            )
-            tick_id = "proactive:emotion:2026-08-17T00:00:00+00:00"
-            receipt = db.execute(
-                """
-                SELECT semantic_job_id, event_id, invocation_id, effect_id,
-                       idempotency_key, attempt
-                FROM emotion_domain_effects
-                """
-            ).fetchone()
-            assert receipt is not None
-            assert tuple(receipt) == (
-                "emotion:proactive.prompt.emotion",
-                tick_id,
-                f"proactive:emotion:proactive.prompt.emotion:{tick_id}",
-                "emotion.state",
-                f"{tick_id}:emotion:proactive.prompt.emotion",
-                1,
-            )
-        finally:
-            db.close()
-    finally:
-        await manager.terminate_all()
-
-
-@pytest.mark.asyncio
-async def test_manager_proactive_commit_survives_cancellation_and_reentry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = await _start_emotion_manager(tmp_path)
-    try:
-        from agent.plugins.generation_job_host import ProactiveDomainEffects
-
-        frame = ProactiveFrame(
-            input=ProactiveTickInput(
-                session_key="proactive:emotion-cancel",
-                started_at=datetime(2026, 8, 17, 0, 1, tzinfo=timezone.utc),
-            )
-        )
-        original_lookup = ProactiveDomainEffects._lookup_committed
-        lookup_calls = 0
-
-        async def cancel_after_commit(self):
-            nonlocal lookup_calls
-            lookup_calls += 1
-            record = await original_lookup(self)
-            if lookup_calls == 2:
-                raise asyncio.CancelledError
-            return record
-
-        monkeypatch.setattr(
-            ProactiveDomainEffects,
-            "_lookup_committed",
-            cancel_after_commit,
-        )
-        with pytest.raises(asyncio.CancelledError):
-            await _run_manager_tick(manager, frame)
-        assert lookup_calls == 2
-
-        monkeypatch.setattr(
-            ProactiveDomainEffects,
-            "_lookup_committed",
-            original_lookup,
-        )
-        resumed = await _run_manager_tick(manager, frame)
-        assert resumed.slots["proactive:prompt:system_bottom:emotion"]
-
-        db = module.open_db(tmp_path / "workspace" / "emotion" / "emotion.db")
-        try:
-            assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 1
-            assert (
-                db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0]
-                == 1
-            )
-        finally:
-            db.close()
-    finally:
-        await manager.terminate_all()
-
-
-def test_manager_proactive_receipt_survives_core_process_crash_and_reentry(
-    tmp_path: Path,
-) -> None:
-    plugin_dir = _copy_emotion_plugin(tmp_path)
-    workspace = tmp_path / "workspace"
-    script = """
-import asyncio
-import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-from agent.plugins.generation_activity_host import ActivityHost
-from agent.plugins.generation_proactive_bridge import CommittedProactiveBridge
-from agent.plugins.generation_proactive_host import ProactiveActivityAdapter
-from agent.plugins.generation_job_host import ProactiveDomainEffects
-from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
-from proactive_v2.frame import ProactiveFrame, ProactiveTickInput
-
-
-async def run_tick(manager, frame):
-    snapshot = manager.current_snapshot
-    activity = manager.activity_host
-    assert snapshot is not None and activity is not None
-    lease = await manager.snapshot_store.acquire(snapshot.snapshot_id)
-    admission = activity.acquire(lease)
-    bridge = CommittedProactiveBridge(activity)
-    token = bridge.bind_execution(lease)
-    try:
-        runtime = bridge.runtime_for(snapshot)
-        modules = bridge.lifecycle_modules(
-            runtime,
-            lifecycle_id="default.proactive.frame.v1",
-        )
-        assert len(modules) == 1
-        await modules[0].run(frame)
-    finally:
-        bridge.reset_execution(token)
-        await admission.release()
-        await lease.release()
-
-
-async def main():
-    plugin_parent = Path(sys.argv[1])
-    workspace = Path(sys.argv[2])
-    manager = PluginManager(
-        plugin_dirs=[plugin_parent],
-        event_bus=EventBus(),
-        tool_registry=None,
-        workspace=workspace,
-        installed_cache_root=workspace.parent / "cache",
+    _ = drift.store.transition(
+        cast(str, selected["selection_token"]), "ready_for_delivery"
     )
-    manager.bind_activity_host(ActivityHost((ProactiveActivityAdapter(),)))
-    original_lookup = ProactiveDomainEffects._lookup_committed
-    lookup_calls = 0
 
-    async def crash_after_commit(self):
-        nonlocal lookup_calls
-        lookup_calls += 1
-        if lookup_calls == 2:
-            os._exit(137)
-        return await original_lookup(self)
-
-    ProactiveDomainEffects._lookup_committed = crash_after_commit
-    await manager.load_all()
-    frame = ProactiveFrame(
-        input=ProactiveTickInput(
-            session_key="proactive:emotion-crash",
-            started_at=datetime(2026, 8, 17, 0, 2, tzinfo=timezone.utc),
-        )
+    await runtime.tick_once()
+    proposals = cast(
+        tuple[dict[str, Any], ...],
+        drift.store.snapshot(NOW)["proposals"],
     )
-    await run_tick(manager, frame)
-
-
-asyncio.run(main())
-"""
-    env = dict(os.environ)
-    core_root = os.environ.get("AKASHIC_AGENT_ROOT") or str(
-        Path(__file__).parents[3] / "akasic-agent"
-    )
-    env["PYTHONPATH"] = core_root + os.pathsep + env.get("PYTHONPATH", "")
-    crashed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            script,
-            str(plugin_dir.parent),
-            str(workspace),
+    second = next(item for item in proposals if item["ref"]["revision"] == "attempt-2")
+    second_turn = {"session_id": "wake:default", "turn_id": "wake-2"}
+    selected = drift.store.select(second["ref"], second_turn, NOW)
+    arguments = {
+        "proposal_id": "emotion-feedback:1-1",
+        "revision": "attempt-2",
+        "context": "用户愿意继续讨论明确引用的主题。",
+        "candidates": [
+            {
+                "effect": "boost",
+                "confidence": "medium",
+                "topic": "明确引用的主题",
+                "action": "提高同一主题后续候选的优先级",
+                "evidence": [1],
+            }
         ],
-        env=env,
-        check=False,
+    }
+    assert await runtime.commit_preference_context(object(), arguments) == {
+        "committed": True,
+        "duplicate": False,
+    }
+    assert await runtime.commit_preference_context(object(), arguments) == {
+        "committed": False,
+        "duplicate": True,
+    }
+    runtime.observe_turn(
+        TurnCommitted(
+            session_key="wake:default",
+            channel="wake",
+            chat_id="chat",
+            input_message="tick",
+            persisted_user_message="tick",
+            assistant_response="已提交",
+            tools_used=["emotion_commit_preference_context"],
+            turn_id="wake-2",
+            timestamp=NOW,
+        )
     )
-    assert crashed.returncode == 137
-
-    db = module.open_db(workspace / "emotion" / "emotion.db")
-    try:
-        assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 1
-        assert (
-            db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0]
-            == 1
+    runtime.observe_turn(
+        TurnCommitted(
+            session_key="wake:default",
+            channel="wake",
+            chat_id="chat",
+            input_message="tick",
+            persisted_user_message="tick",
+            assistant_response="已提交",
+            tools_used=["emotion_commit_preference_context"],
+            turn_id="wake-2",
+            timestamp=NOW,
         )
-    finally:
-        db.close()
-
-    async def reenter() -> None:
-        manager = await _start_emotion_manager(tmp_path, plugin_dir)
-        try:
-            frame = ProactiveFrame(
-                input=ProactiveTickInput(
-                    session_key="proactive:emotion-crash",
-                    started_at=datetime(2026, 8, 17, 0, 2, tzinfo=timezone.utc),
-                )
-            )
-            resumed = await _run_manager_tick(manager, frame)
-            assert resumed.slots["proactive:prompt:system_bottom:emotion"]
-        finally:
-            await manager.terminate_all()
-
-    asyncio.run(reenter())
-    db = module.open_db(workspace / "emotion" / "emotion.db")
-    try:
-        assert db.execute("SELECT COUNT(*) FROM emotion_effects").fetchone()[0] == 1
-        assert (
-            db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0]
-            == 1
-        )
-    finally:
-        db.close()
-
-
-def test_domain_effect_receipt_is_atomic_idempotent_and_durable(tmp_path: Path) -> None:
-    db_path = tmp_path / "emotion" / "emotion.db"
-    conn = module.open_db(db_path)
-    try:
-        digest = hashlib.sha256(b"merged-documents").hexdigest()
-        committed = module.commit_domain_effect(
-            conn,
-            semantic_job_id="emotion:merge_proactive_pending",
-            event_id="drift-1",
-            invocation_id="invocation-1",
-            effect_id="emotion.state",
-            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
-            attempt=1,
-            result_digest=digest,
-        )
-        repeated = module.commit_domain_effect(
-            conn,
-            semantic_job_id="emotion:merge_proactive_pending",
-            event_id="drift-1",
-            invocation_id="invocation-1",
-            effect_id="emotion.state",
-            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
-            attempt=1,
-            result_digest=digest,
-        )
-    finally:
-        conn.close()
-
-    restarted = module.open_db(db_path)
-    try:
-        found = module.lookup_domain_effect(
-            restarted,
-            invocation_id="invocation-1",
-            effect_id="emotion.state",
-            idempotency_key="emotion:merge_proactive_pending:event:drift-1",
-        )
-        rows = restarted.execute(
-            "SELECT COUNT(*) FROM emotion_domain_effects"
-        ).fetchone()
-        with pytest.raises(RuntimeError, match="identity 漂移"):
-            module.commit_domain_effect(
-                restarted,
-                semantic_job_id="emotion:merge_proactive_pending",
-                event_id="drift-1",
-                invocation_id="invocation-2",
-                effect_id="emotion.state",
-                idempotency_key="emotion:merge_proactive_pending:event:drift-1",
-                attempt=1,
-                result_digest=digest,
-            )
-    finally:
-        restarted.close()
-
-    assert committed == repeated == found
-    assert rows is not None and int(rows[0]) == 1
-
-
-def test_domain_effect_receipt_survives_core_process_crash_and_restart(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "emotion" / "emotion.db"
-    plugin_path = Path(__file__).parents[1] / "plugin.py"
-    script = """
-import importlib.util
-import os
-import sys
-import types
-from pathlib import Path
-
-path = Path(sys.argv[1])
-package_name = "emotion_crash_test"
-package = types.ModuleType(package_name)
-package.__path__ = [str(path.parent)]
-sys.modules[package_name] = package
-spec = importlib.util.spec_from_file_location(
-    package_name + ".plugin",
-    path,
-    submodule_search_locations=[str(path.parent)],
-)
-assert spec is not None and spec.loader is not None
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-conn = module.open_db(Path(sys.argv[2]))
-module.commit_domain_effect(
-    conn,
-    semantic_job_id="emotion:merge_proactive_pending",
-    event_id="crash-event",
-    invocation_id="crash-invocation",
-    effect_id="emotion.state",
-    idempotency_key="emotion:merge_proactive_pending:event:crash-event",
-    attempt=1,
-    result_digest="crash-digest",
-)
-conn.close()
-os._exit(137)
-    """
-    env = dict(os.environ)
-    core_root = os.environ.get("AKASHIC_AGENT_ROOT") or str(
-        Path(__file__).parents[3] / "akasic-agent"
     )
-    env["PYTHONPATH"] = core_root + os.pathsep + str(plugin_path.parent)
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(plugin_path), str(db_path)],
-        env=env,
-        check=False,
+    _ = drift.store.transition(
+        cast(str, selected["selection_token"]), "ready_for_delivery"
     )
-    assert result.returncode == 137
-    restarted = module.open_db(db_path)
-    try:
-        found = module.lookup_domain_effect(
-            restarted,
-            invocation_id="crash-invocation",
-            effect_id="emotion.state",
-            idempotency_key="emotion:merge_proactive_pending:event:crash-event",
-        )
-    finally:
-        restarted.close()
-    assert found is not None
-    assert found.result_digest == "crash-digest"
+
+    conn = sqlite3.connect(emotion_root / "emotion.db")
+    runs = conn.execute(
+        "SELECT revision, status, result_json FROM emotion_drift_runs ORDER BY attempt"
+    ).fetchall()
+    assert [(row[0], row[1]) for row in runs] == [
+        ("attempt-1", "completed_without_commit"),
+        ("attempt-2", "completed"),
+    ]
+    assert runs[0][2] is None and runs[1][2] is not None
+    assert conn.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM emotion_feedback_samples").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM emotion_effects").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM emotion_domain_effects").fetchone()[0] == 0
+    conn.close()
+
+
+class ManualHandle:
+    def __init__(self, timer_id: str, deadline: datetime) -> None:
+        self.id = timer_id
+        self.deadline = deadline
+        self._future: asyncio.Future[TimerReceipt] = asyncio.get_running_loop().create_future()
+
+    async def result(self) -> TimerReceipt:
+        return await asyncio.shield(self._future)
+
+    async def cancel(self) -> TimerReceipt:
+        if not self._future.done():
+            self._future.set_result(self._receipt(TimerStatus.CANCELLED))
+        return await asyncio.shield(self._future)
+
+    async def cleanup(self) -> None:
+        _ = await self.cancel()
+
+    def fire(self) -> None:
+        self._future.set_result(self._receipt(TimerStatus.FIRED))
+
+    def _receipt(self, status: TimerStatus) -> TimerReceipt:
+        return TimerReceipt(self.id, self.deadline, self.deadline, status)
+
+
+class ManualTimer:
+    def __init__(self) -> None:
+        self.handles: list[ManualHandle] = []
+
+    def schedule(self, deadline: datetime) -> ManualHandle:
+        handle = ManualHandle(f"timer-{len(self.handles) + 1}", deadline)
+        self.handles.append(handle)
+        return handle
+
+    @property
+    def active(self) -> int:
+        return sum(not handle._future.done() for handle in self.handles)
+
+
+class RecordingContext:
+    def __init__(self) -> None:
+        self.incidents: list[tuple[str, str]] = []
+        self.tasks: list[asyncio.Task[None]] = []
+
+    async def spawn(self, coroutine: Any, *, name: str) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine, name=name)
+        self.tasks.append(task)
+        return task
+
+    def report_incident(self, code: str, detail: str) -> None:
+        self.incidents.append((code, detail))
+
+
+class FailOnceDrift(EmptyDrift):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("temporary drift storage unavailable")
+        return {"inserted": True}
+
+
+class ContractBrokenDrift(EmptyDrift):
+    def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("drift contract mismatch")
+
+
+async def _eventually(predicate: Any) -> None:
+    for _ in range(100):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition did not settle")
 
 
 @pytest.mark.asyncio
-async def test_v3_apply_registers_job_without_opening_emotion_db(tmp_path: Path) -> None:
-    root, emotion_root = await _mount_runtime(tmp_path)
-
-    _ = await root.mount(
-        lambda ctx: module.apply(ctx, object()),
-        name="emotion",
-        inject=(BACKGROUND_JOBS, PROACTIVE_COMPONENTS, UI_SLOTS),
-        runtime=PluginRuntime(
-            plugin_id="emotion",
-            plugin_dir=Path(__file__).parents[1],
-            data_dir=tmp_path / "plugin-data",
-            workspace=emotion_root.parent,
-            config=None,
-            workspace_roots=("emotion",),
-        ),
+async def test_transient_tick_is_observable_and_rearms_without_state_pollution(
+    tmp_path: Path,
+) -> None:
+    module._on_turn_committed(_feedback_turn(), root=tmp_path)
+    timer = ManualTimer()
+    context = RecordingContext()
+    drift = FailOnceDrift()
+    runtime = module.EmotionRuntime(
+        cast(Any, context),
+        tmp_path,
+        PluginTimers(timer),
+        drift,
+        drift,
+        now=lambda: NOW,
     )
-    jobs = root.context.get(BACKGROUND_JOBS)
-    assert jobs is not None
-    catalog = _freeze_plugin_background_jobs(jobs, root.instance_token)
-    binding = catalog.job("emotion:merge_proactive_pending")
-    assert binding is not None
-    assert binding.definition.documents_scope == ("emotion",)
-    assert binding.definition.domain_effect == "emotion.state"
-    assert not (emotion_root / "emotion.db").exists()
-    await root.dispose()
+    await runtime.start()
+    await _eventually(lambda: len(timer.handles) == 1)
+    assert context.incidents[0][0] == "emotion_tick_transient"
+    assert timer.active == 1
+    timer.handles[0].fire()
+    await _eventually(lambda: len(timer.handles) == 2)
+    assert drift.calls == 2
+    assert timer.active == 1
+    await runtime.close()
+    assert timer.active == 0
+
+    replacement = module.EmotionRuntime(
+        cast(Any, context),
+        tmp_path,
+        PluginTimers(timer),
+        drift,
+        drift,
+        now=lambda: NOW,
+    )
+    await replacement.start()
+    await _eventually(lambda: len(timer.handles) == 3)
+    assert timer.active == 1
+    await replacement.close()
+    assert timer.active == 0
 
 
 @pytest.mark.asyncio
-async def test_v3_merge_uses_core_ports_and_durable_emotion_receipt(
+async def test_contract_failure_stops_without_rearming_and_stays_observable(
     tmp_path: Path,
 ) -> None:
-    emotion_root = tmp_path / "workspace" / "emotion"
-    emotion_root.mkdir(parents=True)
-    setattr(module, "_v3_emotion_root", emotion_root)
-    calls: list[str] = []
-    prepared_intent = object()
-    issued_receipt = object()
-
-    class Documents:
-        def read_pair(self):
-            calls.append("read")
-            return (
-                ProactiveDocumentDigests(context=None, pending=None),
-                ProactiveDocumentPair(
-                    context=b"# Proactive Context\n",
-                    pending=b"- [ ] prefer calm summaries\n",
-                ),
-            )
-
-        async def prepare_pair(self, expected, pair):
-            calls.append("prepare")
-            assert expected.pending is None
-            assert pair["pending"] == b""
-            return prepared_intent
-
-        async def commit_after(self, intent, receipt):
-            calls.append("documents")
-            assert intent is prepared_intent
-            assert receipt is issued_receipt
-            return object()
-
-    class Effects:
-        async def run(self, effect_id, transaction):
-            calls.append("effect")
-            effect_ctx = SimpleNamespace(
-                semantic_job_id="emotion:merge_proactive_pending",
-                event_id="drift-v3-1",
-                invocation_id="invocation-v3-1",
-                effect_id=effect_id,
-                idempotency_key="emotion:merge_proactive_pending:event:drift-v3-1",
-                attempt=1,
-            )
-            await transaction(effect_ctx)
-            durable = module.lookup_emotion_domain_effect_v3(effect_ctx)
-            assert durable is not None
-            return issued_receipt
-
-    class Llm:
-        async def generate_text(self, **kwargs):
-            calls.append("llm")
-            assert "prefer calm summaries" in kwargs["prompt"]
-            return "# Proactive Context\n\n- Prefer calm summaries."
-
-    event = DriftFinished(
-        event_id="drift-v3-1",
-        session_key="session",
-        skill_name="feedback-preference-context",
-        status="completed",
-        briefing="briefing",
-        message_result="ok",
-        timestamp=datetime.now(timezone.utc),
+    module._on_turn_committed(_feedback_turn(), root=tmp_path)
+    timer = ManualTimer()
+    context = RecordingContext()
+    drift = ContractBrokenDrift()
+    runtime = module.EmotionRuntime(
+        cast(Any, context),
+        tmp_path,
+        PluginTimers(timer),
+        drift,
+        drift,
+        now=lambda: NOW,
     )
-    ctx = SimpleNamespace(
-        event=event,
-        documents=Documents(),
-        domain_effects=Effects(),
-        llm=Llm(),
-    )
-
-    await module.merge_proactive_pending_v3(ctx)
-
-    assert calls == ["read", "llm", "prepare", "effect", "documents"]
-    db = module.open_db(emotion_root / "emotion.db")
-    try:
-        assert db.execute("SELECT COUNT(*) FROM emotion_domain_effects").fetchone()[0] == 1
-    finally:
-        db.close()
+    await runtime.start()
+    await _eventually(lambda: bool(context.tasks) and context.tasks[0].done())
+    with pytest.raises(RuntimeError, match="drift contract mismatch"):
+        _ = context.tasks[0].result()
+    assert timer.handles == []
+    assert context.incidents == []
+    await runtime.close()

@@ -36,10 +36,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kachofugetsu09/akashic-agent
-          # 5624 lacks the v3 domain-effect lookup export. Keep this exact
-          # Core commit until it is published; checkout failure is intentional
-          # release blocking, not permission to weaken the plugin oracle.
-          ref: 3005f838bcd96e2cbc58616aede46e4f39df4523
+          ref: 9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5
           path: .akashic-core
       - uses: actions/setup-python@v5
         with:
@@ -64,8 +61,8 @@ jobs:
         env:
           AKASHIC_AGENT_ROOT: .akashic-core
           PYTHONPATH: .akashic-core
-        run: pyright --level error plugin.py dashboard.py db.py tests
+        run: pyright --level error plugin.py runtime.py dashboard.py db.py tests
       - name: Compile Python sources
-        run: python -m compileall -q plugin.py dashboard.py db.py drift tests
+        run: python -m compileall -q plugin.py runtime.py dashboard.py db.py drift tests
       - name: Check diff formatting
         run: git diff --check

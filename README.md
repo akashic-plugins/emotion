@@ -1,34 +1,68 @@
 # emotion
 
-Akashic emotion and proactive tuning plugin.
+Akashic 的 Emotion 状态、反馈历史和主动偏好插件。
 
-## v3 接入
+## v3 普通能力组合
 
-入口是 module-level `api_version = 3` 与 `apply(ctx, config)`。Emotion 通过 Core
-声明以下能力：
+Emotion 不拥有 React，也不是 proactive 特权模块。它只组合 Core 已有原子：
 
-- `PROACTIVE_COMPONENTS`：在 exact generation 中形成 VAD prompt projection；formal
-  运行由 `emotion.state` domain effect 提交 SQLite，candidate 不打开数据库。
-- `BACKGROUND_JOBS`：`feedback-preference-context` Drift 完成后，使用 Core 的 LLM
-  lease 和窄 documents port 合并 `PROACTIVE_CONTEXT.md` / `proactive_pending.md`。
-- `AFTER_TURN_COMMITTED`：消费 Core 已提交的 typed Turn。上游若提供
-  `extra.proactive_feedback`，按其稳定 identity 幂等写入；显式引用消息则按 Turn
-  自带标记写入 gold feedback。
-- `UI_SLOTS` 与 C09 Dashboard：移动端和桌面端只读 Emotion 自有投影，不读取
-  `sessions.db`，不取得任意 workspace 句柄。
+```text
+RUNTIME_STARTED
+  └─ TIMERS ──刷新──> emotion_context_current（可覆盖 current）
+              └────> drift.proposals.v1（普通 proposal）
 
-插件不再声明 v2 `Plugin`、EventBus listener、固定 `proactive_modules()` / `jobs()`
-或旧 mobile/dashboard ABI。旧数据库不会在 import/apply 时自动迁移；切换前应先
-停用旧 runtime 并使用独立迁移脚本（尚未将旧源删除）。
+CONTEXT_PREPARED(channel=wake)
+  └─ fresh current ──append──> extra_hints
 
-CI 的 Core pin 是 20062a715d2c5822228b327863b51c8d036119b3，因为旧 pin
-5624a059348406c1f97993612adfec886b158158 没有 domain_effect_lookup_export。
-该 commit 尚未发布到 Core 的公共默认分支前，CI checkout 失败属于明确的发布阻塞；
-本插件必须继续在 integration Core exact worktree 上验证，不得删除 lookup seam 或放宽
-candidate/formal oracle。
+Wake Turn 选择 proposal
+  ├─ 普通 tool ──事务提交──> 完整 drift result + current preference + cursor
+  └─ AFTER_TURN_COMMITTED ──对账──> selected Turn / missing-commit revision
+```
 
-## 移动端看板
+插件声明 `TIMERS`、`TOOL_CATALOG`、`UI_SLOTS`、`drift.proposals.v1` 和
+`drift.wake.v1`。candidate 没有 `RUNTIME_STARTED`，因此不会登记 Timer、打开
+Emotion DB 或产生 formal 写入。formal generation 只有一条 Fiber-owned one-shot
+Timer 链；reload 会先停止旧链再启动新链。
 
-插件通过通用移动 UI 生命周期注册“主动状态”入口，说明用户反馈如何改变 Agent 的语气
-与主动发送把握。移动端只列真正产生状态增量的反馈，不复制桌面端每个 proactive tick
-的 effect 表；原始 VAD 指标默认折叠，需要时再查看。
+当前 hint 只在 `channel=wake` 且刷新时间不超过 10 分钟时追加。它不 abort、
+不 replace，也不污染 passive Turn。外部暂态 `OSError` 会记录 incident 并等待
+下一 Timer；配置、schema、Content/Tool 合同错误保持 fail-loud。
+
+## 事实 owner 与保留
+
+| 事实 | owner | 正常语义 |
+|---|---|---|
+| `emotion_events` | Emotion | 真实情绪观察历史，全量追加保留 |
+| `emotion_feedback_samples` | Emotion | 真实主动反馈样本，全量追加保留 |
+| `emotion_drift_runs` | Emotion | 每个 proposal revision、选择和结果，全量追加保留 |
+| `emotion_state` | Emotion | 当前 VAD singleton，可原位覆盖 |
+| `emotion_context_current` | Emotion | 当前 VAD/presence/hint，可原位覆盖 |
+| `emotion_preference_state` | Emotion | 当前偏好与已提交 cursor，可原位覆盖 |
+| `emotion_effects` | legacy Emotion | 冻结保留，不再新增、不删除 |
+| `emotion_domain_effects` | legacy Emotion | 冻结保留，不再新增、不删除 |
+
+空 tick 只允许刷新 current singleton，不创建 proposal/history。反馈批次先冻结进
+`emotion_drift_runs`，普通 Drift 接受后由 `emotion_commit_preference_context`
+在一个 SQLite transaction 中保存完整结果、替换 current preference、推进 cursor。
+Turn 已提交但工具没提交时，该 revision 记为 `completed_without_commit`；下次为
+同一批证据生成新 revision。重复提交相同结果幂等，identity 漂移会明确失败。
+
+## 旧 proactive island 交接
+
+旧版本曾参与两个 workspace 根文件，但它们是 proactive island 的共享事实，不归
+Emotion 独占：
+
+- `PROACTIVE_CONTEXT.md`：旧 Core `ProactiveDocuments` 读取并成对替换的当前主动规则。
+- `proactive_pending.md`：旧 Drift skill 追加、旧 merge job 清空的共享候选队列。
+
+本版本不声明 `workspace_files`，不读取、写入或清空这两个文件，也不保留
+`PROACTIVE_COMPONENTS`、`BACKGROUND_JOBS`、`DRIFT_FINISHED` 或 private proactive
+module。最终 Core island archive PR 应对旧文件做只读归档 receipt，记录完整 bytes、
+SHA-256、原路径和时间后再 supersede；原文件不由 Emotion 删除。
+
+## 验证边界
+
+测试使用真实 Core DriftStore、Plugin Timer/Tool/UI composition 与隔离 SQLite，覆盖
+candidate 零副作用、fresh wake hint、被动链零污染、proposal 重放、未提交重提、
+工具幂等提交、TurnCommitted selection 时序、暂态 Timer 重臂和 reload 单 Timer。
+这些是隔离 E2E fixture，不声称 hua-home formal activation 或线上 provider E2E。

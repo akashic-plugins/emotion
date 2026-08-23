@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -10,10 +12,14 @@ PROACTIVE_TEXT_LIMIT = 100
 QUESTION_MARKERS = ("吗", "么", "为什么", "怎么", "谁", "哪")
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _clip_text(text: str, limit: int) -> str:

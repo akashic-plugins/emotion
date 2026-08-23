@@ -227,8 +227,11 @@ def open_db(path: Path) -> sqlite3.Connection:
 
     # 1. Existing bytes are inspected read-only before any directory, pragma, or DDL write.
     if path.exists():
-        with _connect_read_only(path) as existing:
+        existing = _connect_read_only(path)
+        try:
             _validate_schema(existing)
+        finally:
+            existing.close()
 
     # 2. Revalidate under the write lock, then create all missing tables in one transaction.
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,7 @@ import importlib.util
 import os
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -110,7 +111,7 @@ def test_pf_accepted_fact_reaches_emotion_only_after_history_pull(
     )
     assert consumer.tick_once() is False
     assert consumer.tick_once() is False
-    with sqlite3.connect(emotion_root / "emotion.db") as emotion:
+    with closing(sqlite3.connect(emotion_root / "emotion.db")) as emotion:
         assert emotion.execute(
             "SELECT count(*) FROM emotion_feedback_samples"
         ).fetchone() == (1,)

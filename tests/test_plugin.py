@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import importlib.util
 import inspect
 import json
 import sqlite3
 import sys
+import warnings
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -206,6 +209,22 @@ def test_feedback_history_is_idempotent_and_mobile_is_read_only(tmp_path: Path) 
     assert before == after
 
 
+def test_open_db_closes_every_read_only_validation_connection(tmp_path: Path) -> None:
+    path = tmp_path / "emotion.db"
+    created = module.open_db(path)
+    created.close()
+    _ = gc.collect()
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always", ResourceWarning)
+        for _ in range(4):
+            connection = module.open_db(path)
+            connection.close()
+        _ = gc.collect()
+
+    assert [warning for warning in seen if warning.category is ResourceWarning] == []
+
+
 @pytest.mark.asyncio
 async def test_empty_tick_overwrites_current_without_appending_history(tmp_path: Path) -> None:
     drift = EmptyDrift()
@@ -326,7 +345,7 @@ def _insert_legacy_pf_event(path: Path, *, user_message_id: str = "u1") -> None:
         "assistant_content_preview": "回答",
         "proactive_content_preview": "提醒",
     }
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             """
             INSERT INTO emotion_events(
@@ -342,6 +361,7 @@ def _insert_legacy_pf_event(path: Path, *, user_message_id: str = "u1") -> None:
             """,
             (json.dumps(payload, ensure_ascii=False),),
         )
+        connection.commit()
 
 
 def test_formal_legacy_upgrade_is_atomic_and_preserves_all_rows(tmp_path: Path) -> None:
@@ -646,7 +666,7 @@ async def _eventually(predicate: Any) -> None:
 
 
 def _count_rows(path: Path, table: str) -> int:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         return int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
 
 

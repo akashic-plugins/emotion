@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
@@ -31,7 +32,7 @@ from .runtime import DriftProposalServices, DriftWakeServices, EmotionRuntime
 
 api_version = 3
 name = "emotion"
-version = "3.0.0"
+version = "3.0.1"
 desc = "Timer-refreshed Emotion context and ordinary Drift preference projection."
 DRIFT_PROPOSALS = ServiceKey[DriftProposalServices]("drift.proposals.v1")
 DRIFT_WAKE = ServiceKey[DriftWakeServices]("drift.wake.v1")
@@ -242,15 +243,16 @@ def _mobile_ui_query(
 
 
 async def emotion_commit_preference_context(
-    tool_context: object,
+    context: object,
     arguments: Mapping[str, object],
-) -> Mapping[str, object]:
+) -> str:
     """Delegate legacy export lookup to the exact Root runtime."""
 
     runtime = _v3_emotion_runtime
     if runtime is None:
         raise RuntimeError("emotion v3 generation 尚未完成 apply")
-    return await runtime.commit_preference_context(tool_context, arguments)
+    result = await runtime.commit_preference_context(context, arguments)
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
 def _commit_tool_schema() -> dict[str, object]:

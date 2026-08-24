@@ -31,7 +31,11 @@ from agent.plugin_composition import (
     RuntimeStarted,
     RuntimeStopping,
 )
-from agent.plugin_composition.tool_catalog import PluginTools, _freeze_plugin_tools
+from agent.plugin_composition.tool_catalog import (
+    PluginToolCatalog,
+    PluginTools,
+    _freeze_plugin_tools,
+)
 from agent.plugin_composition.ui_slots import PluginUiSlots
 from bus.events_lifecycle import TurnCommitted
 from plugins.drift.store import DriftStore
@@ -104,7 +108,9 @@ class EmptyDrift:
         return None
 
 
-async def _mount_candidate(tmp_path: Path) -> tuple[CompositionRoot, Path]:
+async def _mount_candidate(
+    tmp_path: Path,
+) -> tuple[CompositionRoot, Path, PluginToolCatalog]:
     """Mount the real plugin with candidate Timer and ordinary service atoms."""
 
     root = CompositionRoot("emotion-candidate")
@@ -131,12 +137,12 @@ async def _mount_candidate(tmp_path: Path) -> tuple[CompositionRoot, Path]:
             data_access="read_only",
         ),
     )
-    _ = _freeze_plugin_tools(
+    catalog = _freeze_plugin_tools(
         tools,
         root.instance_token,
         {"emotion": root.generation_id},
     )
-    return root, emotion_root
+    return root, emotion_root, catalog
 
 
 def _feedback_turn(turn_id: str = "turn-feedback-1") -> TurnCommitted:
@@ -206,7 +212,10 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
 
 @pytest.mark.asyncio
 async def test_candidate_mount_has_zero_timer_and_zero_workspace_write(tmp_path: Path) -> None:
-    root, emotion_root = await _mount_candidate(tmp_path)
+    root, emotion_root, catalog = await _mount_candidate(tmp_path)
+    binding = catalog.get("emotion_commit_preference_context")
+    assert binding is not None
+    assert binding.handler is module.emotion_commit_preference_context
     assert not emotion_root.exists()
     assert not list(tmp_path.rglob("*.db"))
     await root.dispose()
@@ -1212,7 +1221,7 @@ async def test_feedback_history_composes_in_both_mount_orders_and_uses_timer(
 async def test_feedback_history_candidate_handshake_has_zero_timer_and_db(
     tmp_path: Path,
 ) -> None:
-    root, emotion_root = await _mount_candidate(tmp_path)
+    root, emotion_root, _ = await _mount_candidate(tmp_path)
     history = RecordingHistory([_history_record(1)])
     try:
         async def provider(ctx: Any) -> None:

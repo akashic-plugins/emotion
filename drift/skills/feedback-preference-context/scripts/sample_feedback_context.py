@@ -3,40 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-SKILL_NAME = "feedback-preference-context"
 PROACTIVE_TEXT_LIMIT = 100
 QUESTION_MARKERS = ("吗", "么", "为什么", "怎么", "谁", "哪")
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _load_cursor(drift_dir: Path) -> dict[str, Any]:
-    db_path = drift_dir / "drift.db"
-    if not db_path.exists():
-        return {}
-    with _connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT cursor_json
-            FROM skill_continuum
-            WHERE skill_name = ?
-            """,
-            (SKILL_NAME,),
-        ).fetchone()
-    if row is None:
-        return {}
     try:
-        data = json.loads(str(row["cursor_json"] or "{}"))
-    except json.JSONDecodeError:
-        return {}
-    return cast(dict[str, Any], data) if isinstance(data, dict) else {}
+        yield conn
+    finally:
+        conn.close()
 
 
 def _clip_text(text: str, limit: int) -> str:
@@ -75,47 +58,41 @@ def sample(
     if not emotion_db.is_file() or emotion_db.is_symlink():
         return _empty_result(0, "emotion_db_missing", chunk_index, chunk_size)
 
-    cursor = _load_cursor(drift_dir)
-    last_sample_id = int(cursor.get("latest_processed_emotion_sample_id") or 0)
     safe_limit = max(1, min(int(limit), 50))
-    try:
-        with _connect(emotion_db) as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    created_at,
-                    session_key,
-                    user_message_id,
-                    proactive_message_id,
-                    feedback_type,
-                    confidence,
-                    pa_score,
-                    pua_score,
-                    lag_seconds,
-                    candidate_count,
-                    matched_by,
-                    reason,
-                    user_content_preview,
-                    assistant_content_preview,
-                    proactive_content_preview
-                FROM emotion_feedback_samples
-                WHERE id > ?
-                  AND feedback_type IN ('topic_follow', 'explicit_quote')
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (last_sample_id, safe_limit),
-            ).fetchall()
-    except sqlite3.OperationalError as exc:
-        if "no such table: emotion_feedback_samples" not in str(exc):
-            raise
-        return _empty_result(
-            last_sample_id,
-            "emotion_feedback_samples_missing",
-            chunk_index,
-            chunk_size,
-        )
+    with _connect(emotion_db) as conn:
+        state = conn.execute(
+            "SELECT processed_feedback_sample_id FROM emotion_preference_state WHERE id=1"
+        ).fetchone()
+        if state is None:
+            raise RuntimeError("Emotion preference singleton 缺失")
+        last_sample_id = int(state["processed_feedback_sample_id"])
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                created_at,
+                session_key,
+                user_message_id,
+                proactive_message_id,
+                feedback_type,
+                confidence,
+                pa_score,
+                pua_score,
+                lag_seconds,
+                candidate_count,
+                matched_by,
+                reason,
+                user_content_preview,
+                assistant_content_preview,
+                proactive_content_preview
+            FROM emotion_feedback_samples
+            WHERE id > ?
+              AND feedback_type IN ('topic_follow', 'explicit_quote')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (last_sample_id, safe_limit),
+        ).fetchall()
 
     if not rows:
         return _empty_result(

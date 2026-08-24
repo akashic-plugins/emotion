@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,9 +75,9 @@ def test_typed_turn_feedback_is_readable_without_legacy_databases(tmp_path: Path
     assert result["found"] is True
     assert result["count"] == 1
     event = result["events"][0]
-    assert event["feedback_type"] == "topic_follow"
+    assert event["feedback_type"] == "explicit_quote"
     assert event["message_ids"] == {
-        "proactive": "proactive-sample-1",
+            "proactive": "",
         "user": "user-sample-1",
     }
     assert event["texts"] == {
@@ -106,3 +108,17 @@ def test_feedback_sample_empty_is_closed_without_creating_legacy_reads(tmp_path:
     assert result["found"] is False
     assert result["reason"] == "emotion_feedback_samples_empty"
     assert not (tmp_path / "sessions.db").exists()
+
+
+def test_feedback_sample_closes_read_only_connection(tmp_path: Path) -> None:
+    db = PLUGIN.open_db(tmp_path / "emotion" / "emotion.db")
+    db.close()
+    _ = gc.collect()
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always", ResourceWarning)
+        for _ in range(4):
+            _ = SAMPLE.sample(tmp_path / "drift", 50, 10, 0)
+        _ = gc.collect()
+
+    assert [warning for warning in seen if warning.category is ResourceWarning] == []

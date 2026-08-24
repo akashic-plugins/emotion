@@ -60,6 +60,28 @@ refresh_current_context = sys.modules[
 ].refresh_current_context
 
 
+def test_tool_export_matches_core_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def commit(
+        context: object,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        assert context is tool_context
+        assert arguments == {"proposal_id": "proposal-1"}
+        return {"committed": True}
+
+    tool_context = object()
+    monkeypatch.setattr(
+        module,
+        "_v3_emotion_runtime",
+        SimpleNamespace(commit_preference_context=commit),
+    )
+    handler = module.emotion_commit_preference_context
+    assert tuple(inspect.signature(handler).parameters) == ("context", "arguments")
+    assert json.loads(
+        asyncio.run(handler(tool_context, {"proposal_id": "proposal-1"}))
+    ) == {"committed": True}
+
+
 class DriftServices:
     """Expose both ordinary Drift ports over the real Core store."""
 

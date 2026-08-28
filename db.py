@@ -449,7 +449,7 @@ def prepare_drift_proposal(
     # 1. Replay a locally prepared/submitted proposal before admitting new evidence.
     existing = conn.execute(
         """
-        SELECT proposal_id, revision, payload_json
+        SELECT proposal_id, revision, payload_json, created_at
         FROM emotion_drift_runs
         WHERE status IN ('prepared', 'submitted')
         ORDER BY created_at, proposal_id, revision LIMIT 1
@@ -546,6 +546,7 @@ def prepare_drift_proposal(
         "proposal_id": proposal_id,
         "revision": revision,
         "payload": payload,
+        "due_at": _aware_datetime(now),
     }
 
 
@@ -722,6 +723,7 @@ def _drift_proposal_from_row(row: sqlite3.Row) -> dict[str, object]:
         "proposal_id": str(row["proposal_id"]),
         "revision": str(row["revision"]),
         "payload": payload,
+        "due_at": _aware_datetime(datetime.fromisoformat(str(row["created_at"]))),
     }
 
 

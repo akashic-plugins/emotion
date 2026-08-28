@@ -278,6 +278,33 @@ async def test_empty_tick_overwrites_current_without_appending_history(tmp_path:
     conn.close()
 
 
+@pytest.mark.asyncio
+async def test_submitted_proposal_replay_keeps_original_due_time(tmp_path: Path) -> None:
+    emotion_root = tmp_path / "emotion"
+    module._on_turn_committed(_feedback_turn(), root=emotion_root)
+    drift = DriftServices(tmp_path / "drift.sqlite3")
+    clock = [NOW]
+    runtime = module.EmotionRuntime(
+        cast(Any, object()),
+        emotion_root,
+        PluginTimers.candidate_validation(),
+        drift,
+        drift,
+        now=lambda: clock[0],
+    )
+
+    await runtime.tick_once()
+    clock[0] += timedelta(minutes=5)
+    await runtime.tick_once()
+
+    proposals = cast(
+        tuple[dict[str, Any], ...],
+        drift.store.snapshot(clock[0])["proposals"],
+    )
+    assert len(proposals) == 1
+    assert proposals[0]["due_at"] == NOW.isoformat()
+
+
 def _create_formal_legacy_fixture(path: Path) -> None:
     """Create the exact original three-table formal schema without new migration code."""
 

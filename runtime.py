@@ -112,12 +112,13 @@ class EmotionRuntime:
         proposal_id = cast(str, proposal["proposal_id"])
         revision = cast(str, proposal["revision"])
         payload = cast(Mapping[str, object], proposal["payload"])
+        due_at = cast(datetime, proposal["due_at"])
         _ = self._proposals.propose(
             proposal_id,
             revision,
             payload,
-            now,
-            next_due=now + _REFRESH_INTERVAL,
+            due_at,
+            next_due=due_at + _REFRESH_INTERVAL,
         )
         db = open_db(self._db_path)
         try:

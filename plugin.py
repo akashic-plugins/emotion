@@ -32,7 +32,7 @@ from .runtime import DriftProposalServices, DriftWakeServices, EmotionRuntime
 
 api_version = 3
 name = "emotion"
-version = "3.0.2"
+version = "3.0.3"
 desc = "Timer-refreshed Emotion context and ordinary Drift preference projection."
 DRIFT_PROPOSALS = ServiceKey[DriftProposalServices]("drift.proposals.v1")
 DRIFT_WAKE = ServiceKey[DriftWakeServices]("drift.wake.v1")

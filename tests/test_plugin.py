@@ -129,6 +129,7 @@ async def _mount_candidate(
         inject=module.inject,
         runtime=PluginRuntime(
             plugin_id="emotion",
+            generation_id=root.generation_id,
             plugin_dir=Path(__file__).parents[1],
             data_dir=tmp_path / "plugin-data",
             workspace=emotion_root.parent,
@@ -168,8 +169,6 @@ def _before_turn(channel: str, at: datetime) -> BeforeTurnCtx:
         chat_id="chat",
         content="tick",
         timestamp=at,
-        retrieved_memory_block="",
-        retrieval_trace_raw=None,
         history_messages=(),
     )
 
@@ -832,6 +831,7 @@ async def _mount_formal_with_history(
             inject=module.inject,
             runtime=PluginRuntime(
                 plugin_id="emotion",
+                generation_id=root.generation_id,
                 plugin_dir=Path(__file__).parents[1],
                 data_dir=tmp_path / "plugin-data" / "emotion",
                 workspace=emotion_root.parent,

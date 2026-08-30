@@ -32,7 +32,7 @@ from .runtime import DriftProposalServices, DriftWakeServices, EmotionRuntime
 
 api_version = 3
 name = "emotion"
-version = "3.0.3"
+version = "3.0.4"
 desc = "Timer-refreshed Emotion context and ordinary Drift preference projection."
 DRIFT_PROPOSALS = ServiceKey[DriftProposalServices]("drift.proposals.v1")
 DRIFT_WAKE = ServiceKey[DriftWakeServices]("drift.wake.v1")
@@ -41,10 +41,10 @@ workspace_roots = ("emotion",)
 drift_skill_roots = ("drift/skills",)
 dashboard_module = "dashboard.py"
 web_module = "web_module.js"
-web_requires = ("workbench.panels.v1",)
+web_requires = ("workbench.panels.v2",)
 web_provides = ()
 web_contract_digests = {
-    "workbench.panels.v1": "724b282c22c4b3f3a36967ab664c4dfd8bce4257665f99459000306938caf527",
+    "workbench.panels.v2": "17a005a381b362ae25a0499dbf95bf7a2c3ff0bb4e9b415e7357db458de6b5db",
 }
 _v3_emotion_root: Path | None = None
 _v3_emotion_runtime: EmotionRuntime | None = None

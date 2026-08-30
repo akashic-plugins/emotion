@@ -1,175 +1,168 @@
-export function activate(ctx) {
-  return ctx.ui.inject("workbench.panels.v1", (mount) => mount.register({
-    id: "emotion-decisions",
-    label: "情绪决策",
-    order: 40,
-    render(host) {
-      const panel = document.createElement("section");
-      panel.className = "emotion-workbench-panel";
-      panel.innerHTML = `<header><div><h1>情绪决策</h1><p>查看 Emotion 如何改变主动发送的语气与阈值。</p></div><button type="button" data-refresh>刷新</button></header><section class="emotion-overview" data-overview aria-label="当前情绪状态"><p>正在读取当前状态…</p></section><p data-status role="status" aria-live="polite"></p><div class="emotion-panel-grid"><div><div data-list></div><footer><button type="button" data-previous>上一页</button><span data-page></span><button type="button" data-next>下一页</button></footer></div><article data-detail><p>选择一条情绪影响查看详情。</p></article></div>`;
-      host.replaceChildren(panel);
-      const overview = panel.querySelector("[data-overview]");
-      const refresh = panel.querySelector("[data-refresh]");
-      const status = panel.querySelector("[data-status]");
-      const list = panel.querySelector("[data-list]");
-      const detail = panel.querySelector("[data-detail]");
-      const pageText = panel.querySelector("[data-page]");
-      const previous = panel.querySelector("[data-previous]");
-      const next = panel.querySelector("[data-next]");
-      let page = 1;
-      let total = 0;
-      let disposed = false;
-      let overviewRequest = new AbortController();
-      let listRequest = new AbortController();
-      let detailRequest = new AbortController();
-
-      const loadOverview = async () => {
-        overviewRequest.abort();
-        overviewRequest = new AbortController();
-        const request = overviewRequest;
-        overview.textContent = "正在读取当前状态…";
-        try {
-          const data = await json(ctx, "/api/dashboard/emotion/overview", request.signal);
-          if (disposed || request.signal.aborted) return;
-          overview.innerHTML = renderOverview(data);
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(overview, reason);
-        }
-      };
-
-      const loadList = async () => {
-        listRequest.abort();
-        listRequest = new AbortController();
-        const request = listRequest;
-        const requestedPage = page;
-        status.textContent = "正在读取情绪影响…";
-        try {
-          const data = await json(ctx, `/api/dashboard/emotion/effects?page=${requestedPage}&page_size=25`, request.signal);
-          if (disposed || request.signal.aborted) return;
-          total = finiteNumber(data.total);
-          renderRows(list, data.items, openDetail);
-          const pages = Math.max(1, Math.ceil(total / 25));
-          pageText.textContent = `${requestedPage} / ${pages}`;
-          previous.disabled = requestedPage <= 1;
-          next.disabled = requestedPage >= pages;
-          status.textContent = total ? `共 ${total} 条情绪影响` : "还没有改变主动决策的情绪影响。";
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(status, reason);
-        }
-      };
-
-      const openDetail = async (effectId) => {
-        detailRequest.abort();
-        detailRequest = new AbortController();
-        const request = detailRequest;
-        detail.innerHTML = "<p>正在读取详情…</p>";
-        try {
-          const item = await json(ctx, `/api/dashboard/emotion/effects/${encodeURIComponent(effectId)}`, request.signal);
-          if (disposed || request.signal.aborted) return;
-          detail.innerHTML = renderDetail(item);
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(detail, reason);
-        }
-      };
-
-      refresh.addEventListener("click", () => {
-        void loadOverview();
-        void loadList();
-      });
-      previous.addEventListener("click", () => {
-        if (page > 1) {
-          page -= 1;
-          void loadList();
-        }
-      });
-      next.addEventListener("click", () => {
-        if (page * 25 < total) {
-          page += 1;
-          void loadList();
-        }
-      });
-      void loadOverview();
-      void loadList();
-      return () => {
-        disposed = true;
-        overviewRequest.abort();
-        listRequest.abort();
-        detailRequest.abort();
-        host.replaceChildren();
-      };
-    },
-  }));
-}
-
-function renderOverview(data) {
-  const state = data && typeof data.state === "object" && data.state ? data.state : null;
-  const behavior = data && typeof data.current_behavior === "object" && data.current_behavior
-    ? data.current_behavior
-    : null;
-  if (!state || !behavior) {
-    return `<p>还没有可用的情绪状态。已记录 ${finiteNumber(data && data.effect_count)} 条情绪影响。</p>`;
-  }
-  return `<div><span>当前语气</span><strong>${escapeHtml(behavior.tone_label || "未标注")}</strong></div><div><span>发送阈值</span><strong>${escapeHtml(effectLabel(behavior.expected_effect))}</strong><small>${escapeHtml(deltaText(behavior.threshold_delta))}</small></div><div><span>情绪坐标</span><strong>愉悦 ${escapeHtml(score(state.valence))} · 唤醒 ${escapeHtml(score(state.arousal))} · 支配 ${escapeHtml(score(state.dominance))}</strong></div>`;
-}
-
-function renderRows(target, items, openDetail) {
-  target.replaceChildren();
-  if (!Array.isArray(items) || !items.length) {
-    target.innerHTML = "<p>没有可展示的情绪影响。</p>";
-    return;
-  }
-  for (const item of items) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "emotion-panel-row";
-    button.innerHTML = `<strong>${escapeHtml(effectLabel(item.expected_effect))}</strong><span>${escapeHtml(shortTime(item.created_at))} · ${escapeHtml(String(item.tone_label || "未标注"))}</span><small>愉悦 ${escapeHtml(score(item.valence))} · 唤醒 ${escapeHtml(score(item.arousal))} · 阈值 ${escapeHtml(deltaText(item.threshold_delta))}</small>`;
-    button.addEventListener("click", () => void openDetail(item.id));
-    target.append(button);
-  }
-}
-
-function renderDetail(item) {
-  const delta = deltaText(item.threshold_delta);
-  return `<header><div><p>主动决策输入</p><h2>这次情绪如何改变发送阈值</h2><span>${escapeHtml(String(item.tick_id || "未关联任务"))}</span></div><strong>${escapeHtml(effectLabel(item.expected_effect))}</strong></header><dl class="emotion-detail-metrics"><div><dt>原始阈值</dt><dd>${escapeHtml(score(item.base_threshold))}</dd></div><div><dt>应用情绪后</dt><dd>${escapeHtml(score(item.final_threshold))}</dd></div><div><dt>变化</dt><dd>${escapeHtml(delta)}</dd></div></dl><section><h3>情绪坐标</h3><p>语气：${escapeHtml(String(item.tone_label || "未标注"))}</p><dl class="emotion-detail-coordinates"><div><dt>愉悦度</dt><dd>${escapeHtml(score(item.valence))}</dd></div><div><dt>唤醒度</dt><dd>${escapeHtml(score(item.arousal))}</dd></div><div><dt>支配度</dt><dd>${escapeHtml(score(item.dominance))}</dd></div></dl></section><details><summary>查看写入主动流程的提示词</summary><pre>${escapeHtml(String(item.prompt_section || "-"))}</pre></details><details><summary>查看技术元数据</summary><pre>${escapeHtml(JSON.stringify(item.metadata || {}, null, 2))}</pre></details>`;
-}
-
-async function json(ctx, path, signal) {
-  const response = await ctx.http.request(path, {method: "GET", signal});
+// dashboard_panel.tsx
+import { Chip, chipClass } from "@akashic/dashboard-ui";
+import { jsx, jsxs } from "react/jsx-runtime";
+var dashboardRequest = null;
+async function api(path, init) {
+  if (!dashboardRequest) throw new Error("Emotion \u5DE5\u4F5C\u53F0\u9762\u677F\u672A\u6FC0\u6D3B");
+  const response = await dashboardRequest(path, init);
   const body = await response.json();
-  if (!response.ok) throw new Error(body?.detail || body?.message || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(String(body.detail ?? body.message ?? `HTTP ${response.status}`));
   return body;
 }
-
-function effectLabel(value) {
-  return ({raise_send_bar: "提高发送阈值", lower_send_bar: "降低发送阈值"})[value] || String(value || "-");
+function _score(value) {
+  return typeof value === "number" ? value.toFixed(3) : "-";
 }
-
-function score(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number.toFixed(3) : "-";
+function _delta(value) {
+  if (typeof value !== "number") return "-";
+  return value > 0 ? `+${value.toFixed(3)}` : value.toFixed(3);
 }
-
-function deltaText(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  return number > 0 ? `+${number.toFixed(3)}` : number.toFixed(3);
+function _shortTs(value) {
+  const text = String(value || "");
+  if (!text) return "-";
+  const d = new Date(text);
+  if (Number.isNaN(d.getTime())) return text;
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
-
-function finiteNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
+function _escape(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
-
-function shortTime(value) {
-  const date = new Date(String(value || ""));
-  return Number.isNaN(date.getTime()) ? "-" : new Intl.DateTimeFormat("zh-CN", {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false}).format(date);
+function _effectLabel(value) {
+  const effect = String(value || "");
+  if (effect === "raise_send_bar") return "\u63D0\u9AD8\u53D1\u9001\u9608\u503C";
+  if (effect === "lower_send_bar") return "\u964D\u4F4E\u53D1\u9001\u9608\u503C";
+  return effect || "-";
 }
-
-function showError(target, reason) {
-  target.setAttribute("role", "alert");
-  target.textContent = reason instanceof Error ? reason.message : String(reason);
+function _toneCell(value) {
+  const text = String(value || "-");
+  const tone = text === "raise_send_bar" ? "warning" : text === "lower_send_bar" ? "success" : "muted";
+  return `<span class="${chipClass(tone)}">${_escape(_effectLabel(text))}</span>`;
 }
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (character) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[character]);
+function EmotionDetail(props) {
+  const item = props.item;
+  if (!item) {
+    return /* @__PURE__ */ jsxs("div", { className: "emotion-empty", children: [
+      /* @__PURE__ */ jsx("div", { className: "emotion-empty__title", children: "\u60C5\u7EEA\u5F71\u54CD\u8BE6\u60C5" }),
+      /* @__PURE__ */ jsx("div", { className: "emotion-empty__text", children: "\u9009\u62E9\u4E00\u6761\u8BB0\u5F55\uFF0C\u67E5\u770B\u8FD9\u6B21\u4E3B\u52A8\u4EFB\u52A1\u7684\u60C5\u7EEA\u5F71\u54CD\u3002" })
+    ] });
+  }
+  const delta = typeof item.threshold_delta === "number" ? item.threshold_delta : null;
+  return /* @__PURE__ */ jsxs("main", { className: "emotion-detail", "aria-labelledby": "emotion-detail-title", children: [
+    /* @__PURE__ */ jsxs("header", { className: "emotion-detail__header", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("p", { children: "\u4E3B\u52A8\u51B3\u7B56\u8F93\u5165" }),
+        /* @__PURE__ */ jsx("h2", { id: "emotion-detail-title", children: "\u8FD9\u6B21\u60C5\u7EEA\u5982\u4F55\u6539\u53D8\u53D1\u9001\u9608\u503C" }),
+        /* @__PURE__ */ jsx("span", { children: String(item.tick_id || "\u672A\u5173\u8054\u4EFB\u52A1") })
+      ] }),
+      /* @__PURE__ */ jsx(Chip, { tone: String(item.expected_effect) === "raise_send_bar" ? "warning" : "success", children: _effectLabel(item.expected_effect) })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "emotion-threshold", "aria-label": "\u9608\u503C\u53D8\u5316", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("span", { children: "\u539F\u59CB\u9608\u503C" }),
+        /* @__PURE__ */ jsx("strong", { children: _score(item.base_threshold) })
+      ] }),
+      /* @__PURE__ */ jsx("span", { className: "emotion-threshold__arrow", "aria-hidden": "true", children: "\u2192" }),
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("span", { children: "\u5E94\u7528\u60C5\u7EEA\u540E" }),
+        /* @__PURE__ */ jsx("strong", { children: _score(item.final_threshold) })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { className: `emotion-threshold__delta${delta !== null && delta > 0 ? " is-up" : " is-down"}`, children: [
+        /* @__PURE__ */ jsx("span", { children: "\u53D8\u5316" }),
+        /* @__PURE__ */ jsx("strong", { children: _delta(delta) })
+      ] })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "emotion-coordinates", "aria-labelledby": "emotion-coordinates-title", children: [
+      /* @__PURE__ */ jsxs("div", { className: "emotion-section-heading", children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("p", { children: "VAD \u6A21\u578B" }),
+          /* @__PURE__ */ jsx("h3", { id: "emotion-coordinates-title", children: "\u60C5\u7EEA\u5750\u6807" })
+        ] }),
+        /* @__PURE__ */ jsxs("span", { children: [
+          "\u8BED\u6C14\uFF1A",
+          String(item.tone_label || "\u672A\u6807\u6CE8")
+        ] })
+      ] }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u6109\u60A6\u5EA6", low: "\u6D88\u6781", high: "\u79EF\u6781", value: item.valence }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u5524\u9192\u5EA6", low: "\u5E73\u9759", high: "\u6FC0\u6D3B", value: item.arousal }),
+      /* @__PURE__ */ jsx(VadGauge, { label: "\u652F\u914D\u5EA6", low: "\u53D7\u63A7", high: "\u4E3B\u5BFC", value: item.dominance })
+    ] }),
+    /* @__PURE__ */ jsx(TextDisclosure, { title: "\u67E5\u770B\u5199\u5165\u4E3B\u52A8\u6D41\u7A0B\u7684\u63D0\u793A\u8BCD", text: String(item.prompt_section || "") }),
+    /* @__PURE__ */ jsx(TextDisclosure, { title: "\u67E5\u770B\u6280\u672F\u5143\u6570\u636E", text: JSON.stringify(item.metadata || {}, null, 2) })
+  ] });
 }
+function VadGauge(props) {
+  const numeric = typeof props.value === "number" ? props.value : 0;
+  const position = Math.max(0, Math.min(100, (numeric + 1) / 2 * 100));
+  return /* @__PURE__ */ jsxs("div", { className: "emotion-gauge", children: [
+    /* @__PURE__ */ jsxs("div", { className: "emotion-gauge__label", children: [
+      /* @__PURE__ */ jsx("strong", { children: props.label }),
+      /* @__PURE__ */ jsx("code", { children: _score(props.value) })
+    ] }),
+    /* @__PURE__ */ jsx("div", { className: "emotion-gauge__track", "aria-hidden": "true", children: /* @__PURE__ */ jsx("i", { style: { left: `${position}%` } }) }),
+    /* @__PURE__ */ jsxs("div", { className: "emotion-gauge__ends", children: [
+      /* @__PURE__ */ jsx("span", { children: props.low }),
+      /* @__PURE__ */ jsx("span", { children: props.high })
+    ] })
+  ] });
+}
+function TextDisclosure(props) {
+  return /* @__PURE__ */ jsxs("details", { className: "emotion-disclosure", children: [
+    /* @__PURE__ */ jsx("summary", { children: props.title }),
+    /* @__PURE__ */ jsx("pre", { children: props.text || "-" })
+  ] });
+}
+var panel = {
+  id: "emotion",
+  label: "\u60C5\u7EEA\u51B3\u7B56",
+  viewLabel: "\u60C5\u7EEA\u51B3\u7B56",
+  order: 30,
+  pageSize: 50,
+  rowKey: "id",
+  countTitle(total) {
+    return `\u5171 ${total} \u6761\u60C5\u7EEA\u5F71\u54CD`;
+  },
+  columns: [
+    { key: "created_at", label: "\u65F6\u95F4", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
+    { key: "expected_effect", label: "\u5F71\u54CD", width: 132, renderCell: _toneCell },
+    { key: "tone_label", label: "\u8BED\u6C14", width: 112 },
+    { key: "valence", label: "\u6109\u60A6", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "arousal", label: "\u5524\u9192", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
+    { key: "threshold_delta", label: "\u9608\u503C\u53D8\u5316", width: 82, fmt: "delta", cellClass: "mono cell-metric", align: "right" },
+    { key: "tick_id", label: "\u4EFB\u52A1", flex: true, cellClass: "mono content-preview", rawTitle: true }
+  ],
+  async getCount({ signal }) {
+    try {
+      const overview = await api("/api/dashboard/emotion/overview", { signal });
+      return overview.effect_count || 0;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return null;
+    }
+  },
+  async fetchPage({ page, pageSize, signal }) {
+    const params = new URLSearchParams();
+    params.set("page", String(page));
+    params.set("page_size", String(pageSize));
+    const data = await api(`/api/dashboard/emotion/effects?${params.toString()}`, { signal });
+    return { items: data.items || [], total: data.total || 0 };
+  },
+  async fetchDetail(item, { signal }) {
+    return api(`/api/dashboard/emotion/effects/${item.id}`, { signal });
+  },
+  Detail: EmotionDetail,
+  formatters: {
+    score: (value) => _score(value),
+    delta: (value) => _delta(value),
+    "mono-time": (value) => _shortTs(value)
+  }
+};
+function activate(ctx) {
+  dashboardRequest = ctx.http.request;
+  const release = ctx.ui.inject("workbench.panels.v2", (mount) => mount.register(panel));
+  return () => {
+    release();
+    dashboardRequest = null;
+  };
+}
+export {
+  activate
+};

@@ -9,6 +9,7 @@ import json
 import sqlite3
 import sys
 import warnings
+from collections.abc import Mapping
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,7 +97,9 @@ class DriftServices:
     def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
         return self.store.propose(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
-    def selection(self, accepted_turn: dict[str, object]) -> dict[str, object] | None:
+    def selection(
+        self, accepted_turn: dict[str, object]
+    ) -> Mapping[str, object] | None:
         return self.store.selection(accepted_turn)
 
 

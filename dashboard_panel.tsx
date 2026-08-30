@@ -1,6 +1,18 @@
-/// <reference path="../../types/akashic-dashboard.d.ts" />
 import { type ReactElement } from "react";
-import { Chip, api } from "@akashic/dashboard-ui";
+import { createRoot } from "react-dom/client";
+import "./dashboard_panel.css";
+import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
+import type { WorkbenchDispatch, WorkbenchPanelEntry, WorkbenchUi } from "@akashic/workbench-ui-v2";
+
+let dashboardRequest: WebHostContextV1["http"]["request"] | null = null;
+
+async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  if (!dashboardRequest) throw new Error("Emotion 工作台面板未激活");
+  const response = await dashboardRequest(path, init);
+  const body = await response.json() as T & { detail?: unknown; message?: unknown };
+  if (!response.ok) throw new Error(String(body.detail ?? body.message ?? `HTTP ${response.status}`));
+  return body;
+}
 
 interface Overview {
   state: Record<string, unknown> | null;
@@ -48,13 +60,14 @@ function _effectLabel(value: unknown): string {
 function _toneCell(value: unknown): string {
   const text = String(value || "-");
   const tone = text === "raise_send_bar" ? "warning" : text === "lower_send_bar" ? "success" : "muted";
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(_effectLabel(text))}</span>`;
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_effectLabel(text))}</span>`;
 }
 
-function EmotionDetail(props: { item: Record<string, unknown> | null }): ReactElement {
+function EmotionDetail(props: { item: Record<string, unknown> | null; ui: WorkbenchUi }): ReactElement {
   const item = props.item;
+  const Chip = props.ui.Chip;
   if (!item) {
-    return <div className="detail-empty"><div className="detail-empty-title">情绪影响详情</div><div className="detail-empty-text">选择一条记录，查看这次主动任务的情绪影响。</div></div>;
+    return <div className="emotion-empty"><div className="emotion-empty__title">情绪影响详情</div><div className="emotion-empty__text">选择一条记录，查看这次主动任务的情绪影响。</div></div>;
   }
   const delta = typeof item.threshold_delta === "number" ? item.threshold_delta : null;
   return (
@@ -114,10 +127,11 @@ function TextDisclosure(props: { title: string; text: string }): ReactElement {
   );
 }
 
-window.AkashicDashboard.registerPlugin({
+const panel = {
   id: "emotion",
   label: "情绪决策",
   viewLabel: "情绪决策",
+  order: 30,
   pageSize: 50,
   rowKey: "id",
 
@@ -135,32 +149,46 @@ window.AkashicDashboard.registerPlugin({
     { key: "tick_id", label: "任务", flex: true, cellClass: "mono content-preview", rawTitle: true },
   ],
 
-  async getCount(): Promise<number | null> {
+  async getCount({ signal }: { signal: AbortSignal }): Promise<number | null> {
     try {
-      const overview = await api<Overview>("/api/dashboard/emotion/overview");
+      const overview = await api<Overview>("/api/dashboard/emotion/overview", { signal });
       return overview.effect_count || 0;
-    } catch {
+    } catch (error) {
+      if (signal.aborted) throw error;
       return null;
     }
   },
 
-  async fetchPage({ page, pageSize }: { page: number; pageSize: number }) {
+  async fetchPage({ page, pageSize, signal }: { page: number; pageSize: number; signal: AbortSignal }) {
     const params = new URLSearchParams();
     params.set("page", String(page));
     params.set("page_size", String(pageSize));
-    const data = await api<FetchPage>(`/api/dashboard/emotion/effects?${params.toString()}`);
+    const data = await api<FetchPage>(`/api/dashboard/emotion/effects?${params.toString()}`, { signal });
     return { items: data.items || [], total: data.total || 0 };
   },
 
-  async fetchDetail(item: Record<string, unknown>) {
-    return api<Record<string, unknown>>(`/api/dashboard/emotion/effects/${item.id}`);
+  async fetchDetail(item: Record<string, unknown>, { signal }: { signal: AbortSignal }) {
+    return api<Record<string, unknown>>(`/api/dashboard/emotion/effects/${item.id}`, { signal });
   },
 
-  Detail: EmotionDetail,
+  renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch: WorkbenchDispatch): WebUiDisposer {
+    const root = createRoot(container);
+    root.render(<EmotionDetail item={item} ui={dispatch.ui} />);
+    return () => root.unmount();
+  },
 
   formatters: {
     score: (value: unknown) => _score(value),
     delta: (value: unknown) => _delta(value),
     "mono-time": (value: unknown) => _shortTs(value),
   },
-});
+} satisfies WorkbenchPanelEntry;
+
+export function activate(ctx: WebHostContextV1): WebUiDisposer {
+  dashboardRequest = ctx.http.request;
+  const release = ctx.ui.inject("workbench.panels.v2", (mount) => mount.register(panel));
+  return () => {
+    release();
+    dashboardRequest = null;
+  };
+}

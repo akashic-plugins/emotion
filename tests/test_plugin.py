@@ -38,7 +38,7 @@ from agent.plugin_composition.tool_catalog import (
 )
 from agent.plugin_composition.ui_slots import PluginUiSlots
 from bus.events_lifecycle import TurnCommitted
-from plugins.drift.store import DriftStore
+from plugins.drift.store import DriftSelectionReceipt, DriftStore
 
 NOW = datetime(2026, 8, 23, 8, tzinfo=UTC)
 
@@ -96,7 +96,9 @@ class DriftServices:
     def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
         return self.store.propose(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
-    def selection(self, accepted_turn: dict[str, object]) -> dict[str, object] | None:
+    def selection(
+        self, accepted_turn: dict[str, object]
+    ) -> DriftSelectionReceipt | None:
         return self.store.selection(accepted_turn)
 
 
@@ -129,6 +131,7 @@ async def _mount_candidate(
         inject=module.inject,
         runtime=PluginRuntime(
             plugin_id="emotion",
+            generation_id=root.generation_id,
             plugin_dir=Path(__file__).parents[1],
             data_dir=tmp_path / "plugin-data",
             workspace=emotion_root.parent,
@@ -168,8 +171,6 @@ def _before_turn(channel: str, at: datetime) -> BeforeTurnCtx:
         chat_id="chat",
         content="tick",
         timestamp=at,
-        retrieved_memory_block="",
-        retrieval_trace_raw=None,
         history_messages=(),
     )
 
@@ -276,6 +277,33 @@ async def test_empty_tick_overwrites_current_without_appending_history(tmp_path:
     assert conn.execute("SELECT count(*) FROM emotion_events").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM emotion_feedback_samples").fetchone()[0] == 0
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_submitted_proposal_replay_keeps_original_due_time(tmp_path: Path) -> None:
+    emotion_root = tmp_path / "emotion"
+    module._on_turn_committed(_feedback_turn(), root=emotion_root)
+    drift = DriftServices(tmp_path / "drift.sqlite3")
+    clock = [NOW]
+    runtime = module.EmotionRuntime(
+        cast(Any, object()),
+        emotion_root,
+        PluginTimers.candidate_validation(),
+        drift,
+        drift,
+        now=lambda: clock[0],
+    )
+
+    await runtime.tick_once()
+    clock[0] += timedelta(minutes=5)
+    await runtime.tick_once()
+
+    proposals = cast(
+        tuple[dict[str, Any], ...],
+        drift.store.snapshot(clock[0])["proposals"],
+    )
+    assert len(proposals) == 1
+    assert proposals[0]["due_at"] == NOW.isoformat()
 
 
 def _create_formal_legacy_fixture(path: Path) -> None:
@@ -805,6 +833,7 @@ async def _mount_formal_with_history(
             inject=module.inject,
             runtime=PluginRuntime(
                 plugin_id="emotion",
+                generation_id=root.generation_id,
                 plugin_dir=Path(__file__).parents[1],
                 data_dir=tmp_path / "plugin-data" / "emotion",
                 workspace=emotion_root.parent,

@@ -38,7 +38,7 @@ from agent.plugin_composition.tool_catalog import (
 )
 from agent.plugin_composition.ui_slots import PluginUiSlots
 from bus.events_lifecycle import TurnCommitted
-from plugins.drift.store import DriftStore
+from plugins.drift.store import DriftSelectionReceipt, DriftStore
 
 NOW = datetime(2026, 8, 23, 8, tzinfo=UTC)
 
@@ -96,7 +96,9 @@ class DriftServices:
     def propose(self, *args: object, **kwargs: object) -> dict[str, object]:
         return self.store.propose(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
-    def selection(self, accepted_turn: dict[str, object]) -> dict[str, object] | None:
+    def selection(
+        self, accepted_turn: dict[str, object]
+    ) -> DriftSelectionReceipt | None:
         return self.store.selection(accepted_turn)
 
 

@@ -1,8 +1,8 @@
 import { type ReactElement } from "react";
-import { Chip, chipClass } from "@akashic/dashboard-ui";
+import { createRoot } from "react-dom/client";
 import "./dashboard_panel.css";
 import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
-import type { WorkbenchPanelEntry } from "@akashic/workbench-ui-v2";
+import type { WorkbenchDispatch, WorkbenchPanelEntry, WorkbenchUi } from "@akashic/workbench-ui-v2";
 
 let dashboardRequest: WebHostContextV1["http"]["request"] | null = null;
 
@@ -60,11 +60,12 @@ function _effectLabel(value: unknown): string {
 function _toneCell(value: unknown): string {
   const text = String(value || "-");
   const tone = text === "raise_send_bar" ? "warning" : text === "lower_send_bar" ? "success" : "muted";
-  return `<span class="${chipClass(tone)}">${_escape(_effectLabel(text))}</span>`;
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_effectLabel(text))}</span>`;
 }
 
-function EmotionDetail(props: { item: Record<string, unknown> | null }): ReactElement {
+function EmotionDetail(props: { item: Record<string, unknown> | null; ui: WorkbenchUi }): ReactElement {
   const item = props.item;
+  const Chip = props.ui.Chip;
   if (!item) {
     return <div className="emotion-empty"><div className="emotion-empty__title">情绪影响详情</div><div className="emotion-empty__text">选择一条记录，查看这次主动任务的情绪影响。</div></div>;
   }
@@ -170,7 +171,11 @@ const panel = {
     return api<Record<string, unknown>>(`/api/dashboard/emotion/effects/${item.id}`, { signal });
   },
 
-  Detail: EmotionDetail,
+  renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch: WorkbenchDispatch): WebUiDisposer {
+    const root = createRoot(container);
+    root.render(<EmotionDetail item={item} ui={dispatch.ui} />);
+    return () => root.unmount();
+  },
 
   formatters: {
     score: (value: unknown) => _score(value),

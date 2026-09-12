@@ -19,10 +19,8 @@ from typing import Any, cast
 import pytest
 
 from agent.control.timer import TimerReceipt, TimerStatus
-from agent.lifecycle.types import BeforeTurnCtx
 from agent.plugin_composition import (
     TIMERS,
-    TOOL_CATALOG,
     UI_SLOTS,
     CompositionRoot,
     PluginRuntime,
@@ -32,14 +30,13 @@ from agent.plugin_composition import (
     RuntimeStarted,
     RuntimeStopping,
 )
-from agent.plugin_composition.tool_catalog import (
-    PluginToolCatalog,
-    PluginTools,
-    _freeze_plugin_tools,
-)
 from agent.plugin_composition.ui_slots import PluginUiSlots
+from agent.plugin_contracts import ContentPart, ContentReferences, Input, Message, Output
+from agent.plugin_composition.messages import MessageCatalog
 from bus.events_lifecycle import TurnCommitted
 from plugins.drift.store import DriftStore
+from plugins.turn_projection.plugin import TurnProjection
+from session.log import MessageLog, SessionAttributes
 
 NOW = datetime(2026, 8, 23, 8, tzinfo=UTC)
 
@@ -63,6 +60,73 @@ module = _load_plugin_module()
 refresh_current_context = sys.modules[
     "test_emotion_plugin.db"
 ].refresh_current_context
+
+
+class RecordingToolCatalog:
+    """Capture the tools.v1 registration and expose its real provider callback."""
+
+    def __init__(self) -> None:
+        self.groups: list[str] = []
+        self.registrations: dict[str, dict[str, object]] = {}
+
+    async def declare_group(
+        self, ctx: object, *, always_on: bool = False, description: str = ""
+    ) -> object:
+        del ctx, always_on
+        self.groups.append(description)
+        return object()
+
+    async def register(self, ctx: object, **kwargs: object) -> object:
+        del ctx
+        name = kwargs.get("name")
+        if not isinstance(name, str):
+            raise AssertionError("工具注册必须包含名称")
+        self.registrations[name] = kwargs
+        return SimpleNamespace(name=name)
+
+    async def call(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> object:
+        registration = self.registrations[name]
+        opener = registration["open"]
+        assert callable(opener)
+        async with opener({}) as target:
+            prepared = await target.prepare(arguments, None)
+            assert not isinstance(prepared, str), prepared
+            return await target.invoke(name, prepared)
+
+
+class RecordingMaterials:
+    """Capture context.materials.v3 without importing its implementation."""
+
+    def __init__(self) -> None:
+        self.registrations: dict[str, dict[str, object]] = {}
+
+    async def register(self, ctx: object, **kwargs: object) -> object:
+        del ctx
+        name = kwargs.get("name")
+        if not isinstance(name, str):
+            raise AssertionError("材料注册必须包含名称")
+        self.registrations[name] = kwargs
+        return object()
+
+
+class EmptyMessageCatalog:
+    def snapshot_attributes(self) -> Mapping[str, object]:
+        return {}
+
+    def reader(self, session_id: str) -> object:
+        raise KeyError(session_id)
+
+    async def follow(self):
+        if False:
+            yield {}
+
+
+class EmptyTurnProjection:
+    def project(self, messages: object, source: str) -> tuple[object, ...]:
+        del messages, source
+        return ()
 
 
 def test_tool_export_matches_core_contract(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,16 +177,20 @@ class EmptyDrift:
 
 async def _mount_candidate(
     tmp_path: Path,
-) -> tuple[CompositionRoot, Path, PluginToolCatalog]:
+) -> tuple[CompositionRoot, Path, RecordingToolCatalog]:
     """Mount the real plugin with candidate Timer and ordinary service atoms."""
 
     root = CompositionRoot("emotion-candidate")
-    tools = PluginTools(root.instance_token)
+    tools = RecordingToolCatalog()
+    materials = RecordingMaterials()
     ui = PluginUiSlots()
     drift = EmptyDrift()
     _ = await root.context.provide(TIMERS, PluginTimers.candidate_validation())
-    _ = await root.context.provide(TOOL_CATALOG, tools)
+    _ = await root.context.provide(module.TOOLS, tools)
     _ = await root.context.provide(UI_SLOTS, ui)
+    _ = await root.context.provide(module.MATERIALS, materials)
+    _ = await root.context.provide(module.MESSAGE_CATALOG, EmptyMessageCatalog())
+    _ = await root.context.provide(module.TURN_PROJECTION, EmptyTurnProjection())
     _ = await root.context.provide(module.DRIFT_PROPOSALS, drift)
     _ = await root.context.provide(module.DRIFT_WAKE, drift)
     emotion_root = tmp_path / "workspace" / "emotion"
@@ -135,18 +203,12 @@ async def _mount_candidate(
             generation_id=root.generation_id,
             plugin_dir=Path(__file__).parents[1],
             data_dir=tmp_path / "plugin-data",
-            workspace=emotion_root.parent,
-            config=None,
-            workspace_roots=("emotion",),
-            data_access="read_only",
-        ),
+                workspace=emotion_root.parent,
+                config=None,
+                workspace_roots=("emotion",),
+            ),
     )
-    catalog = _freeze_plugin_tools(
-        tools,
-        root.instance_token,
-        {"emotion": root.generation_id},
-    )
-    return root, emotion_root, catalog
+    return root, emotion_root, tools
 
 
 def _feedback_turn(turn_id: str = "turn-feedback-1") -> TurnCommitted:
@@ -165,14 +227,17 @@ def _feedback_turn(turn_id: str = "turn-feedback-1") -> TurnCommitted:
     )
 
 
-def _before_turn(channel: str, at: datetime) -> BeforeTurnCtx:
-    return BeforeTurnCtx(
-        session_key="wake:default",
-        channel=channel,
-        chat_id="chat",
-        content="tick",
-        timestamp=at,
-        history_messages=(),
+def _material_snapshot(at: datetime) -> tuple[Message, ...]:
+    return (
+        Message(
+            "message-1",
+            "wake:default",
+            1,
+            at,
+            "user",
+            "wake",
+            Input((ContentPart("text", "tick"),)),
+        ),
     )
 
 
@@ -181,8 +246,11 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
     assert inspect.signature(module.apply).parameters.keys() == {"ctx", "config"}
     assert module.inject == (
         TIMERS,
-        TOOL_CATALOG,
+        module.TOOLS,
         UI_SLOTS,
+        module.MATERIALS,
+        module.MESSAGE_CATALOG,
+        module.TURN_PROJECTION,
         module.DRIFT_PROPOSALS,
         module.DRIFT_WAKE,
     )
@@ -197,6 +265,15 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
         "ProactiveModule",
         "ProactiveDocuments",
         'event.extra.get("proactive_feedback")',
+    ):
+        assert removed not in source
+    for removed in (
+        "TOOL_CATALOG",
+        "PluginToolDefinition",
+        "PluginTools",
+        "CONTEXT_PREPARED_EVENT",
+        "AFTER_TURN_COMMITTED",
+        "agent.lifecycle",
     ):
         assert removed not in source
     db_source = (Path(__file__).parents[1] / "db.py").read_text(encoding="utf-8")
@@ -215,12 +292,136 @@ def test_module_uses_only_ordinary_v3_atoms() -> None:
 @pytest.mark.asyncio
 async def test_candidate_mount_has_zero_timer_and_zero_workspace_write(tmp_path: Path) -> None:
     root, emotion_root, catalog = await _mount_candidate(tmp_path)
-    binding = catalog.get("emotion_commit_preference_context")
-    assert binding is not None
-    assert binding.handler is module.emotion_commit_preference_context
+    assert "emotion_commit_preference_context" in catalog.registrations
+    registration = catalog.registrations["emotion_commit_preference_context"]
+    assert callable(registration["open"])
     assert not emotion_root.exists()
     assert not list(tmp_path.rglob("*.db"))
     await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tools_v1_registration_executes_emotion_receipt(tmp_path: Path) -> None:
+    root, emotion_root, catalog = await _mount_candidate(tmp_path)
+    try:
+        module._on_turn_committed(_feedback_turn(), root=emotion_root)
+        registration = catalog.registrations["emotion_commit_preference_context"]
+        opener = registration["open"]
+        assert callable(opener)
+        async with opener({}) as tool:
+            runtime = cast(Any, tool)._runtime
+            await runtime.tick_once()
+            with sqlite3.connect(emotion_root / "emotion.db") as connection:
+                proposal_id, revision, payload_json = connection.execute(
+                    "SELECT proposal_id, revision, payload_json "
+                    "FROM emotion_drift_runs WHERE status='submitted'"
+                ).fetchone()
+            payload = json.loads(payload_json)
+            arguments = {
+                "proposal_id": proposal_id,
+                "revision": revision,
+                "context": "用户愿意继续讨论明确引用的主题。",
+                "candidates": [
+                    {
+                        "effect": "boost",
+                        "confidence": "medium",
+                        "topic": "明确引用的主题",
+                        "action": "提高同一主题后续候选的优先级",
+                        "evidence": [payload["events"][0]["id"]],
+                    }
+                ],
+            }
+            prepared = await tool.prepare(arguments, None)
+            assert isinstance(prepared, Mapping)
+            receipt = await tool.invoke("emotion_commit_preference_context", prepared)
+        assert receipt.outcome == "success"
+        assert receipt.parts[0].kind == "text"
+        assert json.loads(receipt.parts[0].value)["committed"] is True
+    finally:
+        await root.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_message_append_reaches_emotion_without_lifecycle_emit(
+    tmp_path: Path,
+) -> None:
+    root = CompositionRoot("emotion-message-follow")
+    timer = ManualTimer()
+    tools = RecordingToolCatalog()
+    materials = RecordingMaterials()
+    ui = PluginUiSlots()
+    drift = EmptyDrift()
+    log = MessageLog(tmp_path / "sessions.db")
+    log.ensure_session("mobile:follow", SessionAttributes())
+    for key, value in (
+        (TIMERS, PluginTimers(timer)),
+        (module.TOOLS, tools),
+        (UI_SLOTS, ui),
+        (module.MATERIALS, materials),
+        (module.MESSAGE_CATALOG, MessageCatalog(log)),
+        (module.TURN_PROJECTION, TurnProjection()),
+        (module.DRIFT_PROPOSALS, drift),
+        (module.DRIFT_WAKE, drift),
+    ):
+        _ = await root.context.provide(key, value)
+    emotion_root = tmp_path / "workspace" / "emotion"
+    try:
+        _ = await root.mount(
+            lambda ctx: module.apply(ctx, object()),
+            name="emotion",
+            inject=module.inject,
+            runtime=PluginRuntime(
+                plugin_id="emotion",
+                generation_id=root.generation_id,
+                plugin_dir=Path(__file__).parents[1],
+                data_dir=tmp_path / "plugin-data",
+                workspace=emotion_root.parent,
+                config=None,
+                workspace_roots=("emotion",),
+            ),
+        )
+        await root.context.serial(RUNTIME_STARTED, RuntimeStarted())
+        await asyncio.sleep(0.05)
+        content = {"text": lambda part: ContentReferences()}
+        user = log.writer(
+            "mobile:follow",
+            author="user",
+            source="mobile",
+            body_types=(Input,),
+            content=content,
+        )
+        assistant = log.writer(
+            "mobile:follow",
+            author="assistant",
+            source="mobile",
+            body_types=(Output,),
+            content=content,
+        )
+        _ = user.append(
+            "follow-user",
+            Input((ContentPart("text", "被回复消息：主动提醒主题\n\n【你当前新消息】继续"),)),
+        )
+        _ = assistant.append(
+            "follow-assistant",
+            Output((ContentPart("text", "继续回答"),), "complete"),
+        )
+
+        def received() -> bool:
+            if not (emotion_root / "emotion.db").exists():
+                return False
+            with sqlite3.connect(emotion_root / "emotion.db") as connection:
+                return connection.execute(
+                    "SELECT count(*) FROM emotion_events "
+                    "WHERE source_event_id='emotion_explicit_quote:follow-assistant'"
+                ).fetchone()[0] == 1
+
+        await _eventually(
+            received
+        )
+    finally:
+        await root.context.serial(RUNTIME_STOPPING, RuntimeStopping())
+        await root.dispose()
+        log.close()
 
 
 def test_feedback_history_is_idempotent_and_mobile_is_read_only(tmp_path: Path) -> None:
@@ -501,7 +702,7 @@ def test_removed_legacy_write_api_cannot_mutate_frozen_tables(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_fresh_context_appends_only_to_wake(tmp_path: Path) -> None:
+async def test_fresh_material_is_only_published_to_wake(tmp_path: Path) -> None:
     drift = EmptyDrift()
     runtime = module.EmotionRuntime(
         cast(Any, object()),
@@ -515,19 +716,19 @@ async def test_fresh_context_appends_only_to_wake(tmp_path: Path) -> None:
     refresh_current_context(db, now=NOW)
     db.close()
 
-    wake = _before_turn("wake", NOW + timedelta(minutes=1))
-    wake.extra_hints.append("existing")
-    runtime.prepare_context(wake)
-    assert wake.extra_hints[0] == "existing"
-    assert wake.extra_hints[1].startswith("Emotion current:\n")
-    assert wake.abort is False
+    wake = runtime.prepare_material(
+        _material_snapshot(NOW + timedelta(minutes=1)), "wake"
+    )
+    assert wake["reminders"][0]["text"].startswith("Emotion current:\n")
 
-    passive = _before_turn("mobile", NOW + timedelta(minutes=1))
-    runtime.prepare_context(passive)
-    assert passive.extra_hints == []
-    stale = _before_turn("wake", NOW + timedelta(minutes=11))
-    runtime.prepare_context(stale)
-    assert stale.extra_hints == []
+    passive = runtime.prepare_material(
+        _material_snapshot(NOW + timedelta(minutes=1)), "mobile"
+    )
+    assert passive == {}
+    stale = runtime.prepare_material(
+        _material_snapshot(NOW + timedelta(minutes=11)), "wake"
+    )
+    assert stale == {}
 
 
 @pytest.mark.asyncio
@@ -816,13 +1017,17 @@ async def _mount_formal_with_history(
 ) -> tuple[CompositionRoot, ManualTimer, Path]:
     root = CompositionRoot("emotion-pf-" + "-".join(order))
     timer = ManualTimer()
-    tools = PluginTools(root.instance_token)
+    tools = RecordingToolCatalog()
+    materials = RecordingMaterials()
     ui = PluginUiSlots()
     drift = EmptyDrift()
     history = RecordingHistory([_history_record(1)])
     _ = await root.context.provide(TIMERS, PluginTimers(timer))
-    _ = await root.context.provide(TOOL_CATALOG, tools)
+    _ = await root.context.provide(module.TOOLS, tools)
     _ = await root.context.provide(UI_SLOTS, ui)
+    _ = await root.context.provide(module.MATERIALS, materials)
+    _ = await root.context.provide(module.MESSAGE_CATALOG, EmptyMessageCatalog())
+    _ = await root.context.provide(module.TURN_PROJECTION, EmptyTurnProjection())
     _ = await root.context.provide(module.DRIFT_PROPOSALS, drift)
     _ = await root.context.provide(module.DRIFT_WAKE, drift)
     emotion_root = tmp_path / "workspace" / "emotion"
@@ -840,7 +1045,6 @@ async def _mount_formal_with_history(
                 workspace=emotion_root.parent,
                 config=None,
                 workspace_roots=("emotion",),
-                data_access="read_write",
             ),
         )
 
@@ -852,7 +1056,6 @@ async def _mount_formal_with_history(
 
     for item in order:
         await (mount_emotion() if item == "emotion" else mount_feedback())
-    _ = _freeze_plugin_tools(tools, root.instance_token, {"emotion": root.generation_id})
     return root, timer, emotion_root
 
 

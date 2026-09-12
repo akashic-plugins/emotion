@@ -1,26 +1,24 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Any, Protocol
 
-from agent.lifecycle.composition import CONTEXT_PREPARED_EVENT
 from agent.plugin_composition import (
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
     TIMERS,
-    TOOL_CATALOG,
     Context,
+    Effect,
     MobileUiDefinition,
     MobileUiNavigation,
     MobileUiRpcInvalidRequest,
-    PluginToolDefinition,
     ServiceKey,
     UI_SLOTS,
 )
-from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
-from bus.events_lifecycle import TurnCommitted
+from agent.plugin_contracts import ContentPart, Message, json_value
 
 from .db import apply_feedback, open_db
 from .dashboard import EmotionDashboardReader
@@ -28,7 +26,15 @@ from .feedback_history import (
     PROACTIVE_FEEDBACK_HISTORY,
     FeedbackHistoryConsumer,
 )
-from .runtime import DriftProposalServices, DriftWakeServices, EmotionRuntime
+from .message_boundary import MESSAGE_CATALOG, TURN_PROJECTION
+from .runtime import (
+    CommittedTurn,
+    DriftProposalServices,
+    DriftWakeServices,
+    EmotionRuntime,
+    normalize_preference_arguments,
+)
+from .tool_boundary import TOOLS, ToolResultValue
 
 api_version = 3
 name = "emotion"
@@ -36,7 +42,6 @@ version = "3.0.4"
 desc = "Timer-refreshed Emotion context and ordinary Drift preference projection."
 DRIFT_PROPOSALS = ServiceKey[DriftProposalServices]("drift.proposals.v1")
 DRIFT_WAKE = ServiceKey[DriftWakeServices]("drift.wake.v1")
-inject = (TIMERS, TOOL_CATALOG, UI_SLOTS, DRIFT_PROPOSALS, DRIFT_WAKE)
 workspace_roots = ("emotion",)
 drift_skill_roots = ("drift/skills",)
 dashboard_module = "dashboard.py"
@@ -52,50 +57,140 @@ _v3_emotion_runtime: EmotionRuntime | None = None
 _FEEDBACK_PREVIEW_MAX_CHARS = 2400
 
 
+class MaterialRegistry(Protocol):
+    async def register(
+        self,
+        ctx: Context,
+        *,
+        name: str,
+        prepare: Callable[[Sequence[Message], str], Awaitable[Mapping[str, object]]],
+        priority: int = 0,
+        prompt: bool = False,
+        reduce: object | None = None,
+    ) -> Effect: ...
+
+
+MATERIALS = ServiceKey[MaterialRegistry]("context.materials.v3")
+inject = (
+    TIMERS,
+    TOOLS,
+    UI_SLOTS,
+    MATERIALS,
+    MESSAGE_CATALOG,
+    TURN_PROJECTION,
+    DRIFT_PROPOSALS,
+    DRIFT_WAKE,
+)
+
+
+class _EmotionPreferenceTool:
+    """Expose Emotion's real commit operation through the tools owner boundary."""
+
+    idempotent = True
+
+    def __init__(self, runtime: EmotionRuntime):
+        self._runtime = runtime
+
+    async def prepare(
+        self,
+        arguments: Mapping[str, object],
+        source: object | None = None,
+    ) -> Mapping[str, object] | str:
+        """Validate the fixed schema once and return the final JSON arguments."""
+
+        del source
+        try:
+            return normalize_preference_arguments(arguments)
+        except (TypeError, ValueError) as error:
+            return str(error)
+
+    async def invoke(
+        self, key: str, arguments: Mapping[str, object]
+    ) -> ToolResultValue:
+        """Commit through Emotion's durable owner and return its real receipt."""
+
+        del key
+        raw = json_value(arguments)
+        if not isinstance(raw, Mapping):
+            raise TypeError("工具参数必须是 object")
+        result = await self._runtime.commit_preference_context(None, raw)
+        return ToolResultValue(
+            "success",
+            (ContentPart("text", json.dumps(result, ensure_ascii=False, sort_keys=True)),),
+        )
+
+    async def query(self, key: str) -> ToolResultValue | None:
+        """The durable Emotion commit is replay-safe; no separate query receipt exists."""
+
+        del key
+        return None
+
+
 async def apply(ctx: Context, config: object) -> None:
-    """Compose Emotion from Timer, lifecycle, Drift, Tool, and UI atoms."""
+    """Compose Emotion from Timer, materials, ordinary Tool, Drift, and UI atoms."""
 
     # 1. 冻结 exact Root；apply/candidate 不打开数据库、不登记真实 Timer。
     del config
     global _v3_emotion_root, _v3_emotion_runtime
     _v3_emotion_root = ctx.workspace_root("emotion")
     emotion_root = _v3_emotion_root
+    def on_turn_committed(event: CommittedTurn) -> None:
+        _on_turn_committed(event, root=emotion_root, runtime=runtime)
+
     runtime = EmotionRuntime(
         ctx,
         emotion_root,
         ctx.require(TIMERS),
         ctx.require(DRIFT_PROPOSALS),
         ctx.require(DRIFT_WAKE),
+        catalog=ctx.require(MESSAGE_CATALOG),
+        projection=ctx.require(TURN_PROJECTION),
+        on_turn=on_turn_committed,
     )
     _v3_emotion_runtime = runtime
 
-    # 2. Drift 结果只经普通 Tool 进入 Emotion 自有事务。
-    await ctx.require(TOOL_CATALOG).register(
+    # 2. Drift 结果只经 tools owner 的普通 provider 进入 Emotion 自有事务。
+    catalog = ctx.require(TOOLS)
+    _ = await catalog.declare_group(ctx, description=desc)
+
+    @asynccontextmanager
+    async def open_tool(_state: Mapping[str, object]):
+        yield _EmotionPreferenceTool(runtime)
+
+    _ = await catalog.register(
         ctx,
-        PluginToolDefinition(
-            name="emotion_commit_preference_context",
-            description=(
-                "提交当前 Emotion Drift proposal 的稳定主动偏好；"
-                "完整结果进入 Emotion history，current context 原位替换。"
-            ),
-            parameters=_commit_tool_schema(),
-            handler_export="emotion_commit_preference_context",
-            risk="read-write",
-            search_hint="emotion drift preference feedback",
+        name="emotion_commit_preference_context",
+        description=(
+            "提交当前 Emotion Drift proposal 的稳定主动偏好；"
+            "完整结果进入 Emotion history，current context 原位替换。"
         ),
-        handler=emotion_commit_preference_context,
+        parameters=_commit_tool_schema(),
+        open=open_tool,
+        idempotent=True,
+        risk="read-write",
+        search_hint="emotion drift preference feedback",
     )
 
-    # 3. Timer/lifecycle/Turn observer 都属于同一个 generation Fiber。
-    def on_turn_committed(event: TurnCommitted) -> None:
-        _on_turn_committed(event, root=emotion_root, runtime=runtime)
+    # 3. Wake current is a low-trust material, not a lifecycle/Core event.
+    materials = ctx.require(MATERIALS)
 
-    await ctx.on(AFTER_TURN_COMMITTED, on_turn_committed)
-    await ctx.on(CONTEXT_PREPARED_EVENT, runtime.prepare_context)
+    async def prepare_material(
+        snapshot: Sequence[Message], source: str
+    ) -> Mapping[str, object]:
+        return runtime.prepare_material(snapshot, source)
+
+    _ = await materials.register(
+        ctx,
+        name="emotion-current",
+        prepare=prepare_material,
+        priority=150,
+    )
+
+    # 4. Timer/lifecycle/Turn observer 都属于同一个 generation Fiber。
     await ctx.on(RUNTIME_STARTED, lambda _: runtime.start())
     await ctx.on(RUNTIME_STOPPING, lambda _: runtime.close())
 
-    # 4. PF history is an optional pull composition with its own Timer/Fiber.
+    # 5. PF history is an optional pull composition with its own Timer/Fiber.
     async def apply_feedback_history(child: Context) -> None:
         consumer = FeedbackHistoryConsumer(
             child,
@@ -112,7 +207,7 @@ async def apply(ctx: Context, config: object) -> None:
         name="proactive-feedback-history",
     )
 
-    # 5. Mobile 只读查询与静态资源绑定到同一个 generation Root。
+    # 6. Mobile 只读查询与静态资源绑定到同一个 generation Root。
     def mobile_query(
         method: str,
         payload: dict[str, object],
@@ -143,7 +238,7 @@ async def apply(ctx: Context, config: object) -> None:
 
 
 def _on_turn_committed(
-    event: TurnCommitted,
+    event: CommittedTurn,
     *,
     root: Path | None = None,
     runtime: EmotionRuntime | None = None,
@@ -171,7 +266,7 @@ def _on_turn_committed(
 
 
 def _explicit_quote_feedback_from_turn(
-    event: TurnCommitted,
+    event: CommittedTurn,
 ) -> dict[str, Any] | None:
     """Project Emotion's direct explicit-quote signal in its own namespace."""
 

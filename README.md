@@ -11,24 +11,27 @@ RUNTIME_STARTED
   └─ TIMERS ──刷新──> emotion_context_current（可覆盖 current）
               └────> drift.proposals.v1（普通 proposal）
 
-CONTEXT_PREPARED(channel=wake)
-  └─ fresh current ──append──> extra_hints
+context.materials.v3(source=wake)
+  └─ fresh current ──> reminders（低信任材料）
 
-Wake Turn 选择 proposal
-  ├─ 普通 tool ──事务提交──> 完整 drift result + current preference + cursor
-  └─ AFTER_TURN_COMMITTED ──对账──> selected Turn / missing-commit revision
+MessageCatalog.follow + TurnProjection
+  ├─ Wake Turn 选择 proposal
+  └─ 完整 Turn ──对账──> selected Turn / missing-commit revision
+
+普通 tools.v1 provider
+  └─ 事务提交 ──> 完整 drift result + current preference + cursor
 
 proactive-feedback.history.v1（可选）
   └─ TIMERS ──pull page──> Emotion observation/sample + PF cursor（同一事务）
 ```
 
-插件声明 `TIMERS`、`TOOL_CATALOG`、`UI_SLOTS`、`drift.proposals.v1` 和
-`drift.wake.v1`。candidate 没有 `RUNTIME_STARTED`，因此不会登记 Timer、打开
+插件声明 `TIMERS`、`tools.v1`、`UI_SLOTS`、`context.materials.v3`、
+`drift.proposals.v1` 和 `drift.wake.v1`。candidate 没有 `RUNTIME_STARTED`，因此不会登记 Timer、打开
 Emotion DB 或产生 formal 写入。formal generation 的 current refresh 和可选 feedback
 pull 各有一条职责独立的 Fiber-owned one-shot Timer 链；PF service 缺席时 pull child
 保持 pending。reload 会先停止旧 child，再从 Emotion 自有 cursor 启动新 child。
 
-当前 hint 只在 `channel=wake` 且刷新时间不超过 10 分钟时追加。它不 abort、
+当前 reminder 只在材料来源为 `wake` 且刷新时间不超过 10 分钟时发布。它不 abort、
 不 replace，也不污染 passive Turn。外部暂态 `OSError` 会记录 incident 并等待
 下一 Timer；配置、schema、Content/Tool 合同错误保持 fail-loud。
 
@@ -47,7 +50,8 @@ pull 各有一条职责独立的 Fiber-owned one-shot Timer 链；PF service 缺
 | `emotion_domain_effects` | legacy Emotion | 冻结保留，不再新增、不删除 |
 
 空 tick 只允许刷新 current singleton，不创建 proposal/history。反馈批次先冻结进
-`emotion_drift_runs`，普通 Drift 接受后由 `emotion_commit_preference_context`
+`emotion_drift_runs`，普通 Drift 接受后由 `tools.v1` 注册的
+`emotion_commit_preference_context`
 在一个 SQLite transaction 中保存完整结果、替换 current preference、推进 cursor。
 Turn 已提交但工具没提交时，该 revision 记为 `completed_without_commit`；下次为
 同一批证据生成新 revision。重复提交相同结果幂等，identity 漂移会明确失败。
